@@ -1,0 +1,11 @@
+dcargs
+flax
+jax
+jaxlib
+jaxlie
+jax_dataclasses
+optax
+tqdm
+# tensorflow is needed for tensorboard logging in JAX
+tensorflow
+git+https://github.com/brentyi/fifteen.git
