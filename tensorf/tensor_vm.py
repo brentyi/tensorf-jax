@@ -42,7 +42,12 @@ class TensorVM:
             )(prng_keys)
         )
 
-    def interpolate(self, ijk: jnp.ndarray) -> jnp.ndarray:
+    @functools.partial(jax.jit, static_argnums=2)
+    def interpolate(
+        self,
+        ijk: jnp.ndarray,
+        use_magic_vmap: bool = True,
+    ) -> jnp.ndarray:
         """Look up a coordinate in our VM decomposition.
 
         Input should have shape (3, *) and be in the range [-1.0, 1.0].
@@ -56,7 +61,7 @@ class TensorVM:
         assert indices.shape == (3, 3, *batch_axes)
 
         interpolate_func = TensorVMSingle.interpolate
-        if len(batch_axes) >= 2:
+        if use_magic_vmap:
             # TODO: the vmap here is unnecessary and can be functionally ignored, but
             # results in a large performance increase (3~4x increase in training
             # throughput for single-precision, ~1.5x in mixed-precision).
@@ -66,6 +71,9 @@ class TensorVM:
             #
             # Setting the axis to -1 also produces a speedup, albeit a slightly smaller
             # one. Numerical results are identical in either case.
+            assert (
+                len(batch_axes) >= 2
+            ), "Magic vmap requires >=2 batch axes on ijk array."
             interpolate_func = jax.vmap(
                 interpolate_func,
                 in_axes=(None, -2),

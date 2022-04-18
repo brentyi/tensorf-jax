@@ -228,9 +228,9 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             step=0,
         )
 
-    @functools.partial(jax.jit, donate_argnums=0)
+    @functools.partial(jax.jit, donate_argnums=0, static_argnums=2)
     def training_step(
-        self, minibatch: data.RenderedRays
+        self, minibatch: data.RenderedRays, use_magic_vmap: bool
     ) -> Tuple[TrainState, fifteen.experiments.TensorboardLogData]:
         """Single training step."""
         render_prng_key, new_prng_key = jax.random.split(self.prng_key)
@@ -259,6 +259,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                     density_samples_per_ray=density_samples_per_ray,
                     appearance_samples_per_ray=appearance_samples_per_ray,
                 ),
+                use_magic_vmap=use_magic_vmap,
             )
             assert (
                 rendered.shape

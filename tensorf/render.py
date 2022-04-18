@@ -94,7 +94,7 @@ def render_rays_batched(
     return out_concatenated.reshape(batch_axes + out_concatenated.shape[1:])
 
 
-@functools.partial(jax.jit, static_argnums=(0, 5))
+@functools.partial(jax.jit, static_argnums=(0, 5, 6))
 def render_rays(
     appearance_mlp: networks.FeatureMlp,
     learnable_params: LearnableParams,
@@ -102,6 +102,7 @@ def render_rays(
     rays_wrt_world: cameras.Rays3D,
     prng_key: Optional[jax.random.KeyArray],
     config: RenderConfig,
+    use_magic_vmap: bool = True,
 ) -> jnp.ndarray:
     """Render a set of rays.
 
@@ -137,7 +138,9 @@ def render_rays(
     # Note that vmapping over -2 is much more efficient than -1, is much more
     # efficient than flattening and then unflattening the batch axes, even though they
     # all produce the exact same results.
-    density_feat = learnable_params.density_tensor.interpolate(points)
+    density_feat = learnable_params.density_tensor.interpolate(
+        points, use_magic_vmap=use_magic_vmap
+    )
     # density_feat = jax.vmap(
     #     learnable_params.density_tensor.interpolate,
     #     in_axes=-2,
@@ -173,6 +176,7 @@ def render_rays(
             appearance_mlp=appearance_mlp,
             config=config,
             prng_key=render_rgb_prng_key,
+            use_magic_vmap=use_magic_vmap,
         )
         assert rgb.shape == (ray_count, config.density_samples_per_ray, 3)
         assert unbias_coeffs.shape == (ray_count,)
@@ -385,6 +389,7 @@ def _rgb_from_points(
     appearance_mlp: networks.FeatureMlp,
     config: RenderConfig,
     prng_key: jax.random.KeyArray,
+    use_magic_vmap: bool,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Helper for rendering RGB values. Returns an RGB array of shape `(ray_count,
     config.samples_per_ray, 3)`, and an unbiasing coefficient array of shape
@@ -416,7 +421,7 @@ def _rgb_from_points(
     assert visible_points.shape == (3, ray_count, config.appearance_samples_per_ray)
 
     appearance_tensor = learnable_params.appearance_tensor
-    appearance_feat = appearance_tensor.interpolate(visible_points)
+    appearance_feat = appearance_tensor.interpolate(visible_points, use_magic_vmap)
     assert appearance_feat.shape == (
         appearance_tensor.channel_dim(),
         ray_count,
