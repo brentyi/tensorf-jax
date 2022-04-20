@@ -1,13 +1,13 @@
 import dataclasses
 import pathlib
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 
 @dataclasses.dataclass(frozen=True)
 class OptimizerConfig:
     lr_init_tensor: float = 0.02  # `lr_init` in the original code.
     lr_init_mlp: float = 1e-3  # `lr_basis` in the original code.
-    lr_decay_iters: int = -1  # If -1, defaults to n_iters.
+    lr_decay_iters: Optional[int] = None  # If unset, defaults to n_iters.
     lr_decay_target_ratio: float = 0.1
     lr_upsample_reset: bool = True  # Reset learning rate after upsampling.
 

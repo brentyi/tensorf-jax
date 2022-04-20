@@ -87,6 +87,9 @@ to JAX!
     - [x] Vectorized
 - [x] Training
   - [x] Learning rate scheduler
+    - [x] ADAM + grouped LR
+    - [x] Exponential decay
+    - [x] Reset decay after upsampling
   - [x] Running
   - [x] Checkpointing
   - [x] Logging

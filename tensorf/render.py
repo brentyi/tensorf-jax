@@ -248,17 +248,17 @@ def compute_segment_probabilities(
     sigmas: jnp.ndarray, step_size: jnp.ndarray
 ) -> SegmentProbabilities:
     r"""Compute some probabilities needed for rendering a *single* ray. Expects sigmas of shape
-      (*, sample_count) and a per-ray step size of shape (*,).
+    (*, sample_count) and a per-ray step size of shape (*,).
 
-      Each of the ray segments we're rendering is broken up into samples. We can treat the
-    s  densities as piecewise constant and use an exponential distribution and compute:
+    Each of the ray segments we're rendering is broken up into samples. We can treat the
+    densities as piecewise constant and use an exponential distribution and compute:
 
-        1. P(ray exits s) = exp(\sum_{i=1}^s -(sigma_i * l_i)
-        2. P(ray terminates in s | ray exits s-1) = 1.0 - exp(-sigma_s * l_s)
-        3. P(ray terminates in s, ray exits s-1)
-           = P(ray terminates at s | ray exits s-1) * P(ray exits s-1)
+      1. P(ray exits s) = exp(\sum_{i=1}^s -(sigma_i * l_i)
+      2. P(ray terminates in s | ray exits s-1) = 1.0 - exp(-sigma_s * l_s)
+      3. P(ray terminates in s, ray exits s-1)
+         = P(ray terminates at s | ray exits s-1) * P(ray exits s-1)
 
-      where l_i is the length of segment i.
+    where l_i is the length of segment i.
     """
 
     # Note that it's trivial to support more complex shapes, but we can just use a vmap.
@@ -339,7 +339,6 @@ def sample_points_along_ray(
 class RaySegmentSpecification:
     t_min: jnp.ndarray
     t_max: jnp.ndarray
-    valid_mask: jnp.ndarray
 
 
 def ray_segment_from_bounding_box(
@@ -369,12 +368,14 @@ def ray_segment_from_bounding_box(
     t_min = jnp.maximum(0.0, jnp.max(t_min_per_axis))
     t_max = jnp.min(t_max_per_axis)
     t_max_clipped = jnp.maximum(t_max, t_min + min_segment_length)
+
+    # TODO: this should likely be returned as well, and used as a mask for supervision.
+    # Currently our loss includes rays outside of the bounding box.
     valid_mask = t_min < t_max
 
     return RaySegmentSpecification(
         t_min=jnp.where(valid_mask, t_min, 0.0),
         t_max=jnp.where(valid_mask, t_max_clipped, min_segment_length),
-        valid_mask=valid_mask,
     )
 
 

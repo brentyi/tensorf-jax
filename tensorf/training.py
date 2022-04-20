@@ -178,16 +178,28 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
         # Compute learning rate decay.
         # We could put this in the optax chain as well, but explicitly computing here
-        # makes logging easier.
-        lr_decay_iters = self.config.optimizer.lr_decay_iters
-        if lr_decay_iters == -1:
-            lr_decay_iters = self.config.n_iters
+        # makes logging & reset handling easier.
+        if self.config.optimizer.lr_upsample_reset:
+            # For resetting after upsampling, we find the smallest non-negative value of
+            # (current step - upsampling iteration #).
+            step_deltas = self.step - jnp.array((0,) + self.config.upsamp_iters)
+            step_deltas = jnp.where(
+                step_deltas >= 0, step_deltas, jnp.iinfo(step_deltas.dtype).max
+            )
+            resetted_step = jnp.min(step_deltas)
+        else:
+            resetted_step = self.step
+
+        decay_iters = self.config.optimizer.lr_decay_iters
+        if decay_iters is None:
+            decay_iters = self.config.n_iters
+
         lr_decay_coeff = optax.exponential_decay(
             init_value=1.0,
-            transition_steps=lr_decay_iters,
+            transition_steps=decay_iters,
             decay_rate=self.config.optimizer.lr_decay_target_ratio,
             end_value=self.config.optimizer.lr_decay_target_ratio,
-        )(self.step)
+        )(resetted_step)
 
         # Propagate gradients through ADAM, learning rate scheduler, etc.
         updates, new_optimizer_state = self.optimizer.update(
