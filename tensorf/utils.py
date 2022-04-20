@@ -18,11 +18,11 @@ def psnr_from_mse(mse: jnp.ndarray) -> jnp.ndarray:
     return psnr.astype(jnp.float32)
 
 
-def eps_from_dtype(dtype: Any, eps_f16=9e-4, eps_f32=1e-8) -> float:
+def eps_from_dtype(dtype: Any, eps_f16=1e-4, eps_f32=1e-8) -> float:
     """Get precision constants from data-type."""
-    if dtype == jnp.float16:
+    if jnp.issubdtype(dtype, jnp.float16):
         return eps_f16
-    elif dtype in (jnp.bfloat16, jnp.float32):
+    elif jnp.issubdtype(dtype, jnp.float32):
         return eps_f32
     else:
         assert False

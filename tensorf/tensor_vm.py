@@ -24,7 +24,7 @@ class TensorVM:
     @staticmethod
     def initialize(
         grid_dim: int,
-        channel_dim: int,
+        per_axis_channel_dim: int,
         init: Callable[[jax.random.KeyArray, Shape, Dtype], jnp.ndarray],
         prng_key: jax.random.KeyArray,
         dtype: Dtype,
@@ -34,7 +34,7 @@ class TensorVM:
             stacked_single_vm=jax.vmap(
                 lambda prng_key: TensorVMSingle.initialize(
                     grid_dim,
-                    channel_dim,
+                    per_axis_channel_dim,
                     init,
                     prng_key=prng_key,
                     dtype=dtype,
@@ -57,12 +57,15 @@ class TensorVM:
 
         interpolate_func = TensorVMSingle.interpolate
         if len(batch_axes) >= 2:
-            # TODO: the vmap here is unnecessary and can be functionally ignored, but
-            # results in a large performance increase (3~4x increase in training
-            # throughput for single-precision, ~1.5x in mixed-precision).
+            # TODO: this magic vmap is unnecessary and doesn't impact numerical results,
+            # but enables a massive performance increase. This is 3~4x better training
+            # throughput for single-precision, ~1.5x in mixed-precision.
             #
-            # I'm not exactly sure why, but imagine it impacts either memory layout or
-            # how XLA ends up parallelizing the underlying operations?
+            # I'm not exactly sure why, but it appears to:
+            # - Shuffle the memory layout and improve access patterns.
+            # - Reduce the length of the HLO generated during tracing by ~150 lines.
+            #
+            # Some plots/discussion: https://github.com/google/jax/discussions/10332
             #
             # Setting the axis to -1 also produces a speedup, albeit a slightly smaller
             # one. Numerical results are identical in either case.
@@ -75,7 +78,7 @@ class TensorVM:
         # Vectorize over axis=0, which will be of size 3. (one for each vector-matrix
         # pair)
         #
-        # Empirically, applying this after the (unnecessary) vmap above is slightly
+        # Empirically, applying this after the magic vmap above is slightly
         # faster than applying it before.
         interpolate_func = jax.vmap(interpolate_func)
 

@@ -40,7 +40,13 @@ results after 5~10 minutes of training:
    python ./train_lego.py --help
    ```
 
-4. To generate some renders, visit `./render.ipynb` in Jupyter. Or:
+4. To monitor training, we use Tensorboard:
+
+   ```bash
+   tensorboard --logdir=./runs/
+   ```
+
+5. To generate some renders, visit `./render.ipynb` in Jupyter. Or:
 
    ```bash
    python ./render_360.py --help
@@ -48,9 +54,7 @@ results after 5~10 minutes of training:
 
 ## Differences from the PyTorch implementation
 
-We're currently able to get reasonable performance (30+ train set PSNR in ~1
-minute, 35+ after 30k iterations), but things aren't totally matched to the
-official implementation:
+Things aren't totally matched to the official implementation:
 
 - The official implementation relies heavily on masking operations to improve
   runtime (for example, by using a weight threshold for sampled points). These
@@ -58,8 +62,8 @@ official implementation:
   replace them with workarounds like weighted sampling.
 - Several training details that would likely improve performance are not yet
   implemented: bounding box refinement, ray filtering, regularization, etc.
-- We include mixed-precision training, which can speed training up by a
-  significant factor.
+- We include mixed-precision training, which can speed training throughput up by
+  a significant factor.
 
 ## References
 
@@ -110,4 +114,5 @@ to JAX!
   - [x] Generate some GIFs
 - [ ] Misc engineering
   - [x] Actions
-  - [ ] Understand vmap ordering differences for interpolation
+  - [ ] Understand vmap performance differences
+        ([details](https://github.com/google/jax/discussions/10332))

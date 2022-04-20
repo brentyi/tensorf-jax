@@ -4,7 +4,7 @@ import dataclasses
 import enum
 import functools
 import math
-from typing import Optional, Tuple, cast
+from typing import Any, Optional, Tuple, cast
 
 import flax
 import jax
@@ -94,7 +94,7 @@ def render_rays_batched(
     return out_concatenated.reshape(batch_axes + out_concatenated.shape[1:])
 
 
-@functools.partial(jax.jit, static_argnums=(0, 5))
+@functools.partial(jax.jit, static_argnames=("appearance_mlp", "config", "dtype"))
 def render_rays(
     appearance_mlp: networks.FeatureMlp,
     learnable_params: LearnableParams,
@@ -102,10 +102,18 @@ def render_rays(
     rays_wrt_world: cameras.Rays3D,
     prng_key: Optional[jax.random.KeyArray],
     config: RenderConfig,
+    *,
+    dtype: Any = jnp.float32,
 ) -> jnp.ndarray:
     """Render a set of rays.
 
     Output should have shape `(ray_count, 3)`."""
+
+    # Cast everything to the desired dtype.
+    learnable_params, aabb, rays_wrt_world = jax.tree_map(
+        lambda x: x.astype(dtype), (learnable_params, aabb, rays_wrt_world)
+    )
+
     (ray_count,) = rays_wrt_world.get_batch_axes()
 
     sample_prng_key, render_rgb_prng_key = jax.random.split(prng_key)
@@ -130,19 +138,7 @@ def render_rays(
     assert points.shape == (3, ray_count, config.density_samples_per_ray)
 
     # Pull interpolated density features out of tensor decomposition.
-    #
-    # TODO: the vmap here is unnecessary, but results in a large performance increase.
-    # (~2x increase in throughput). I'm not sure why.
-    #
-    # Note that vmapping over -2 is much more efficient than -1, is much more
-    # efficient than flattening and then unflattening the batch axes, even though they
-    # all produce the exact same results.
     density_feat = learnable_params.density_tensor.interpolate(points)
-    # density_feat = jax.vmap(
-    #     learnable_params.density_tensor.interpolate,
-    #     in_axes=-2,
-    #     out_axes=-2,
-    # )(points)
     assert density_feat.shape == (
         density_feat.shape[0],
         ray_count,
@@ -162,10 +158,9 @@ def render_rays(
         == (ray_count, config.density_samples_per_ray)
     )
 
-    dtype = sigmas.dtype
     if config.mode is RenderMode.RGB:
         # Get RGB array.
-        rgb, unbias_coeffs = _rgb_from_points(
+        rgb, unbias_coeff = _rgb_from_points(
             rays_wrt_world=rays_wrt_world,
             probs=probs,
             learnable_params=learnable_params,
@@ -173,25 +168,32 @@ def render_rays(
             appearance_mlp=appearance_mlp,
             config=config,
             prng_key=render_rgb_prng_key,
+            dtype=dtype,
         )
         assert rgb.shape == (ray_count, config.density_samples_per_ray, 3)
-        assert unbias_coeffs.shape == (ray_count,)
+        assert unbias_coeff.shape == (ray_count,)
+
+        # No need to backprop through the unbiasing coefficient! This can also cause
+        # instability in mixed-precision mode.
+        unbias_coeff = jax.lax.stop_gradient(unbias_coeff)
 
         # One thing I don't have intuition for: is there something special about RGB
         # that makes this weighted average/expected value meaningful? Is this
         # because RGB is additive? Can we just do this with any random color space?
         expected_rgb = (
             jnp.sum(rgb * probs.p_terminates[:, :, None], axis=-2)
-            * unbias_coeffs[:, None]
+            * unbias_coeff[:, None]
         )
         assert expected_rgb.shape == (ray_count, 3)
 
         # Add white background.
         assert probs.p_exits.shape == (ray_count, config.density_samples_per_ray)
         background_color = jnp.ones(3, dtype=dtype)
-        expected_rgb = expected_rgb + probs.p_exits[:, -1:] * background_color
-        assert expected_rgb.shape == (ray_count, 3)
-        return expected_rgb
+        expected_rgb_with_background = (
+            expected_rgb + probs.p_exits[:, -1:] * background_color
+        )
+        assert expected_rgb_with_background.shape == (ray_count, 3)
+        return expected_rgb_with_background
 
     elif config.mode is RenderMode.DIST_MEDIAN:
         # Compute depth via median.
@@ -308,7 +310,6 @@ def sample_points_along_ray(
     assert ray_wrt_world.origins.shape == ray_wrt_world.directions.shape == (3,)
 
     # Get segment of ray that's within the bounding box.
-    # TODO: valid mask is not being used.
     segment = ray_segment_from_bounding_box(
         ray_wrt_world, aabb=aabb, min_segment_length=1e-3
     )
@@ -385,6 +386,7 @@ def _rgb_from_points(
     appearance_mlp: networks.FeatureMlp,
     config: RenderConfig,
     prng_key: jax.random.KeyArray,
+    dtype: Any,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Helper for rendering RGB values. Returns an RGB array of shape `(ray_count,
     config.samples_per_ray, 3)`, and an unbiasing coefficient array of shape
@@ -440,13 +442,14 @@ def _rgb_from_points(
                 (ray_count * config.appearance_samples_per_ray, -1)
             ),
             viewdirs=viewdirs,
+            dtype=dtype,
         ),
     ).reshape((ray_count, config.appearance_samples_per_ray, 3))
 
     rgb = (
         jnp.zeros(
             (ray_count, config.density_samples_per_ray, 3),
-            dtype=visible_rgb.dtype,
+            dtype=dtype,
         )
         .at[jnp.arange(ray_count)[:, None], appearance_indices, :]
         .set(visible_rgb)
@@ -471,15 +474,17 @@ def _rgb_from_points(
         ray_count,
         config.appearance_samples_per_ray,
     )
+
     unbias_coeff = (
         # The 0.95 term in the example.
         1.0
         - probs.p_exits[:, -1]
-        + utils.eps_from_dtype(rgb.dtype)
+        + utils.eps_from_dtype(dtype)
     ) / (
         # The 0.7 term in the example.
         jnp.sum(sampled_p_terminates, axis=1)
-        + utils.eps_from_dtype(rgb.dtype)
+        + utils.eps_from_dtype(dtype)
     )
     assert unbias_coeff.shape == (ray_count,)
+
     return rgb, unbias_coeff

@@ -59,8 +59,17 @@ class TensorfConfig:
     # update_alphamask_iters: Tuple[int, ...] = (2000, 4000)
 
     # If enabled, we use mixed-precision training. This seems to work and speeds up
-    # training by a significant factor, but is just disabled by default because we
-    # haven't fully evaluated stability, impact on convergence, etc. Probably fine
-    # though!
+    # training throughput by a significant factor, but is disabled by default because we
+    # haven't fully evaluated stability, impact on convergence, hyperparameters, etc.
+    #
+    # Important: if mixed precision is enabled, the loss scale should generally be set
+    # to something high!
     mixed_precision: bool = False
-    mixed_precision_loss_scale: float = 10.0
+
+    # Loss scale for preventing gradient underflow.
+    #
+    # Applied always but useful mostly for mixed-precision training, where we observe a
+    # tradeoff where a higher value will produce lower errors and improve convergence,
+    # but can run slower despite a nearly identical computation graph. (possibly due to
+    # some reduced sparsity of gradients?)
+    loss_scale: float = 1.0

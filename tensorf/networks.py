@@ -43,15 +43,13 @@ class FeatureMlp(nn.Module):
     feature_n_freqs: int = 6
     viewdir_n_freqs: int = 6
 
-    # Computation and out dtype, used for mixed-precision training. Note that parameters
-    # will be float32, even if this is set to float16.
-    dtype: Dtype = jnp.float32
-
     @nn.compact
     def __call__(  # type: ignore
         self,
         features: jnp.ndarray,
         viewdirs: jnp.ndarray,
+        # Computation dtype. Main parameters will always be float32.
+        dtype: Any = jnp.float32,
     ) -> jnp.ndarray:
         *batch_axes, feat_dim = features.shape
         assert viewdirs.shape == (*batch_axes, 3)
@@ -62,7 +60,7 @@ class FeatureMlp(nn.Module):
             features=self.feature_squash_dim,
             kernel_init=linear_layer_init,
             use_bias=False,
-            dtype=self.dtype,
+            dtype=dtype,
         )(features)
 
         # Compute fourier features.
@@ -91,7 +89,7 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=self.units,
             kernel_init=relu_layer_init,
-            dtype=self.dtype,
+            dtype=dtype,
         )(x)
         x = nn.relu(x)
         assert x.shape == (*batch_axes, self.units)
@@ -100,7 +98,7 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=self.units,
             kernel_init=relu_layer_init,
-            dtype=self.dtype,
+            dtype=dtype,
         )(x)
         x = nn.relu(x)
         assert x.shape == (*batch_axes, self.units)
@@ -109,7 +107,7 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=3,
             kernel_init=linear_layer_init,
-            dtype=self.dtype,
+            dtype=dtype,
         )(x)
         assert x.shape == (*batch_axes, 3)
 
