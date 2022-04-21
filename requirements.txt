@@ -4,7 +4,7 @@ jax
 jaxlib
 jaxlie
 jax_dataclasses
-optax
+optax>=0.1.2
 tqdm
 # tensorflow is needed for tensorboard logging in JAX
 tensorflow

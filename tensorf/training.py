@@ -279,7 +279,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             assert isinstance(adam_state, optax.ScaleByAdamState)
             nu: render.LearnableParams = adam_state.nu
             mu: render.LearnableParams = adam_state.mu
-            resized.optimizer_state = [
+            resized.optimizer_state = (
                 adam_state._replace(  # NamedTuple `_replace()`.
                     nu=jdc.replace(
                         nu,
@@ -291,8 +291,8 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                         density_tensor=mu.density_tensor.resize(new_grid_dim),
                         appearance_tensor=mu.appearance_tensor.resize(new_grid_dim),
                     ),
-                )
-            ] + resized.optimizer_state[1:]
+                ),
+            ) + resized.optimizer_state[1:]
         return resized
 
 
