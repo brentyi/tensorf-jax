@@ -348,8 +348,11 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
 
     # Run!
     print("Training with config:", config)
-    time_prev = time.time()
-    for _ in tqdm(range(config.n_iters - train_state.step), desc="Training"):
+    loop_metrics: fifteen.utils.LoopMetrics
+    for loop_metrics in tqdm(
+        fifteen.utils.range_with_metrics(config.n_iters - train_state.step),
+        desc="Training",
+    ):
         # Load minibatch.
         minibatch = next(minibatches)
         assert minibatch.get_batch_axes() == (config.minibatch_size,)
@@ -364,13 +367,12 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
         time_now = time.time()
         experiment.log(
             log_data.merge_scalars(
-                {"train/iterations_per_sec": 1.0 / (time_now - time_prev)}
+                {"train/iterations_per_sec": loop_metrics.iterations_per_sec}
             ),
             step=train_step,
             log_scalars_every_n=5,
             log_histograms_every_n=100,
         )
-        time_prev = time_now
         if train_step % 1000 == 0:
             experiment.save_checkpoint(
                 train_state,

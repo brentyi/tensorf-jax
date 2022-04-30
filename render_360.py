@@ -97,7 +97,7 @@ def main(args: Args) -> None:
             image = onp.array(rendered)
 
             # Visualization heuristics for "depths".
-            image = 1.0 / jnp.maximum(image, 1e-4)
+            image = 1.0 / onp.maximum(image, 1e-4)
             image -= 0.15
             image *= 5.0
             image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
