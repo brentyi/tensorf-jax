@@ -247,7 +247,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
 def compute_segment_probabilities(
     sigmas: jnp.ndarray, step_size: jnp.ndarray
 ) -> SegmentProbabilities:
-    r"""Compute some probabilities needed for rendering a *single* ray. Expects sigmas of shape
+    r"""Compute some probabilities needed for rendering rays. Expects sigmas of shape
     (*, sample_count) and a per-ray step size of shape (*,).
 
     Each of the ray segments we're rendering is broken up into samples. We can treat the
@@ -261,7 +261,7 @@ def compute_segment_probabilities(
     where l_i is the length of segment i.
     """
 
-    # Note that it's trivial to support more complex shapes, but we can just use a vmap.
+    # Support arbitrary leading batch axes.
     (*batch_axes, sample_count) = sigmas.shape
     assert step_size.shape == (*batch_axes,)
 
@@ -270,7 +270,7 @@ def compute_segment_probabilities(
     p_exits = jnp.exp(jnp.cumsum(neg_scaled_sigmas, axis=-1))
     assert p_exits.shape == (*batch_axes, sample_count)
 
-    # Equation 2. This is not used outside of this function, so we don't currently return it.
+    # Equation 2. Not used outside of this function, and not returned.
     p_terminates_given_exits_prev = 1.0 - jnp.exp(neg_scaled_sigmas)
     assert p_terminates_given_exits_prev.shape == (*batch_axes, sample_count)
 

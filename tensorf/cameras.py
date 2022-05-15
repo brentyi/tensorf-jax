@@ -98,10 +98,8 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         """Input is a scalar u/v coordinate. Output is a Rays struct, with origin and
         directions of shape (3,).,"""
 
-        # Important: note the negative 1 for OpenGL convention!!
+        # 2D -> 3D projection: `R_world_camera @ K^-1 @ [u v 1]^T`.
         uv_coord_homog = jnp.array([u, v, 1.0])
-
-        # 2D -> 3D projection: `R_world_camera @ K^-1 @ [u v -1]^T`.
         T_world_camera = self.T_camera_world.inverse()
         ray_direction_wrt_world = (
             T_world_camera.rotation().as_matrix()

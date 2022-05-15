@@ -24,7 +24,6 @@ if __name__ == "__main__":
         dataset_path=pathlib.Path("./data/nerf_synthetic/lego"),
         dataset_type="blender",
         n_iters=30000,
-        optimizer=tensorf.train_config.OptimizerConfig(),
         initial_aabb_min=(-0.6585, -1.1833, -0.4651),
         initial_aabb_max=(0.6636, 1.1929, 1.0512),
         appearance_feat_dim=48,

@@ -63,7 +63,8 @@ Things aren't totally matched to the official implementation:
 - Several training details that would likely improve performance are not yet
   implemented: bounding box refinement, ray filtering, regularization, etc.
 - We include mixed-precision training, which can speed training throughput up by
-  a significant factor.
+  a significant factor. (is this actually faster in terms of wall-clock time?
+  unclear)
 
 ## References
 

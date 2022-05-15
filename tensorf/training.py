@@ -364,7 +364,6 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
 
         # Log & checkpoint.
         train_step = int(train_state.step)
-        time_now = time.time()
         experiment.log(
             log_data.merge_scalars(
                 {"train/iterations_per_sec": loop_metrics.iterations_per_sec}

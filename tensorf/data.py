@@ -1,6 +1,7 @@
+import concurrent.futures
 import json
 import pathlib
-from typing import List, Literal
+from typing import Iterable, List, Literal, TypeVar
 
 import jax
 import jax_dataclasses as jdc
@@ -78,26 +79,38 @@ def load_blender_dataset(
 ) -> List[RegisteredRgbaView]:
     """Load a NeRF training dataset as a list of registered views of a scene."""
 
-    with open(dataset_root / f"transforms_{split}.json") as f:
-        metadata = json.load(f)
-    fov_x_radians: float = metadata["camera_angle_x"]
-
-    out = []
-
     # Transformation from Blender camera coordinates to OpenCV ones. We like the OpenCV
     # convention.
     T_blendercam_camera = jaxlie.SE3.from_rotation(jaxlie.SO3.from_x_radians(onp.pi))
 
-    for frame in (
-        tqdm(metadata["frames"], desc=f"Loading {dataset_root.stem}")
-        if progress_bar
-        else metadata["frames"]
-    ):
-        # Expected keys in each frame.
-        # TODO: what is rotation?
+    # Read metadata: image paths, transformation matrices, FOV.
+    with open(dataset_root / f"transforms_{split}.json") as f:
+        metadata: dict = json.load(f)
+
+    image_paths: List[pathlib.Path] = []
+    transform_matrices: List[onp.ndarray] = []
+    for frame in metadata["frames"]:
+        # Expected keys in each frame. TODO: what is rotation?
         assert frame.keys() == {"file_path", "rotation", "transform_matrix"}
 
-        image = onp.array(PIL.Image.open(dataset_root / f"{frame['file_path']}.png"))
+        image_paths.append(dataset_root / f"{frame['file_path']}.png")
+        transform_matrices.append(
+            onp.array(frame["transform_matrix"], dtype=onp.float32)
+        )
+        assert transform_matrices[-1].shape == (4, 4)  # Should be in SE(3).
+    fov_x_radians: float = metadata["camera_angle_x"]
+    del metadata
+
+    # Parallelized image loading + data preprocessing.
+    out = []
+    for image, transform_matrix in zip(
+        _threaded_image_fetcher(image_paths),
+        _optional_tqdm(
+            transform_matrices,
+            enable=progress_bar,
+            desc=f"Loading {dataset_root.stem}",
+        ),
+    ):
         assert image.dtype == onp.uint8
         height, width = image.shape[:2]
 
@@ -108,13 +121,8 @@ def load_blender_dataset(
         image = (image / 255.0).astype(onp.float32)
 
         # Compute extrinsics.
-        T_world_blendercam = jaxlie.SE3.from_matrix(
-            onp.array(frame["transform_matrix"], dtype=onp.float32)
-        )
-        T_world_camera = T_world_blendercam @ T_blendercam_camera
-
-        T_camera_world = T_world_camera.inverse()
-
+        T_world_blendercam = jaxlie.SE3.from_matrix(transform_matrix)
+        T_camera_world = (T_world_blendercam @ T_blendercam_camera).inverse()
         out.append(
             RegisteredRgbaView(
                 image_rgba=image,  # type: ignore
@@ -127,6 +135,28 @@ def load_blender_dataset(
             )
         )
     return out
+
+
+T = TypeVar("T", bound=Iterable)
+
+
+def _optional_tqdm(iterable: T, enable: bool, desc: str = "") -> T:
+    """Wraps an iterable with tqdm if `enable=True`."""
+    return tqdm(iterable, desc) if enable else iterable  # type: ignore
+
+
+def _threaded_image_fetcher(paths: Iterable[pathlib.Path]) -> Iterable[onp.ndarray]:
+    """Maps an iterable over image paths to an iterable over image arrays, which are
+    opened via PIL.
+
+    Helpful for parallelizing IO."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        for image in executor.map(
+            lambda p: onp.array(PIL.Image.open(p)),
+            paths,
+            chunksize=4,
+        ):
+            yield image
 
 
 if __name__ == "__main__":
