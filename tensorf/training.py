@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import math
-import time
 from typing import Tuple
 
 import fifteen
@@ -19,14 +18,14 @@ from . import data, networks, render, tensor_vm, train_config, utils
 
 @jdc.pytree_dataclass
 class TrainState(jdc.EnforcedAnnotationsMixin):
-    config: train_config.TensorfConfig = jdc.static_field()
+    config: jdc.Static[train_config.TensorfConfig]
 
     # Representation/parameters.
-    appearance_mlp: networks.FeatureMlp = jdc.static_field()
+    appearance_mlp: jdc.Static[networks.FeatureMlp]
     learnable_params: render.LearnableParams
 
     # Optimizer.
-    optimizer: optax.GradientTransformation = jdc.static_field()
+    optimizer: jdc.Static[optax.GradientTransformation]
     optimizer_state: optax.OptState
 
     # Current axis-aligned bounding box.

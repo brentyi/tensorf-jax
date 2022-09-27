@@ -26,8 +26,8 @@ class Camera(jdc.EnforcedAnnotationsMixin):
     T_camera_world: jaxlie.SE3
     """Extrinsics."""
 
-    image_width: int = jdc.static_field()
-    image_height: int = jdc.static_field()
+    image_width: jdc.Static[int]
+    image_height: jdc.Static[int]
 
     @staticmethod
     def from_fov(

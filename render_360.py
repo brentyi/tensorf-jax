@@ -116,4 +116,4 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     fifteen.utils.pdb_safety_net()
-    main(dcargs.parse(Args))
+    main(dcargs.cli(Args))

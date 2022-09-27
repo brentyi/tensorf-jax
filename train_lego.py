@@ -36,9 +36,9 @@ if __name__ == "__main__":
     )
 
     # Parse arguments.
-    config = dcargs.parse(
+    config = dcargs.cli(
         tensorf.train_config.TensorfConfig,
-        default_instance=lego_config,
+        default=lego_config,
     )
 
     # Run training loop!
