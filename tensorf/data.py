@@ -114,11 +114,15 @@ def load_blender_dataset(
         assert image.dtype == onp.uint8
         height, width = image.shape[:2]
 
-        # Note that this is RGBA!
-        assert image.shape == (height, width, 4)
-
         # [0, 255] => [0, 1]
         image = (image / 255.0).astype(onp.float32)
+
+        # Note that this is RGBA!
+        if image.shape[-1] == 3:
+            image = onp.concatenate(
+                [image, onp.ones((height, width, 1), dtype=onp.float32)], axis=-1
+            )
+        assert image.shape == (height, width, 4)
 
         # Compute extrinsics.
         T_world_blendercam = jaxlie.SE3.from_matrix(transform_matrix)

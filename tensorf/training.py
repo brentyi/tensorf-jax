@@ -68,14 +68,14 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 per_axis_channel_dim=config.appearance_feat_dim,
                 init=normal_init,
                 prng_key=prng_keys[1],
-                dtype=jnp.float32,  # Main copy of parameters are always float32.
+                dtype=jnp.float16,  # Main copy of parameters are always float32.
             ),
             density_tensor=tensor_vm.TensorVM.initialize(
                 grid_dim=grid_dim,
                 per_axis_channel_dim=config.density_feat_dim,
                 init=normal_init,
                 prng_key=prng_keys[2],
-                dtype=jnp.float32,
+                dtype=jnp.float16,
             ),
         )
         optimizer = TrainState._make_optimizer(config.optimizer)
@@ -156,11 +156,12 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         # Compute gradients.
         log_data: fifteen.experiments.TensorboardLogData
         grads: render.LearnableParams
-        learnable_params = jax.tree_map(
-            # Cast parameters to desired precision.
-            lambda x: x.astype(compute_dtype),
-            self.learnable_params,
-        )
+        learnable_params = self.learnable_params
+        # learnable_params = jax.tree_map(
+        #     # Cast parameters to desired precision.
+        #     lambda x: x.astype(compute_dtype),
+        #     self.learnable_params,
+        # )
         (loss, log_data), grads = jax.value_and_grad(
             compute_loss,
             has_aux=True,
@@ -168,10 +169,11 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
         # To prevent NaNs from momentum computations in mixed-precision mode, it's
         # important that gradients are float32 before being passed to the optimizer.
-        grads_unscaled = jax.tree_map(
-            lambda x: x.astype(jnp.float32) / self.config.loss_scale,
-            grads,
-        )
+        grads_unscaled = grads
+        # grads_unscaled = jax.tree_map(
+        #     lambda x: x.astype(jnp.float32) / self.config.loss_scale,
+        #     grads,
+        # )
         assert jnp.issubdtype(
             jax.tree_leaves(grads_unscaled)[0].dtype, jnp.float32
         ), "Gradients should always be float32."

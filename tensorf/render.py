@@ -110,9 +110,9 @@ def render_rays(
     Output should have shape `(ray_count, 3)`."""
 
     # Cast everything to the desired dtype.
-    learnable_params, aabb, rays_wrt_world = jax.tree_map(
-        lambda x: x.astype(dtype), (learnable_params, aabb, rays_wrt_world)
-    )
+    # learnable_params, aabb, rays_wrt_world = jax.tree_map(
+    #     lambda x: x.astype(dtype), (learnable_params, aabb, rays_wrt_world)
+    # )
 
     (ray_count,) = rays_wrt_world.get_batch_axes()
 
@@ -138,15 +138,20 @@ def render_rays(
     assert points.shape == (3, ray_count, config.density_samples_per_ray)
 
     # Pull interpolated density features out of tensor decomposition.
-    density_feat = learnable_params.density_tensor.interpolate(points)
+    density_feat = learnable_params.density_tensor.interpolate(
+        points.astype(jnp.float16)
+    )
     assert density_feat.shape == (
         density_feat.shape[0],
         ray_count,
         config.density_samples_per_ray,
     )
+    assert jnp.issubdtype(density_feat.dtype, jnp.float16)
+    density_feat = density_feat.astype(jnp.float32)
 
     # Density from features.
-    sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
+    # sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
+    sigmas = jnp.exp(jnp.sum(density_feat, axis=0) + jnp.log(10.0))
     assert sigmas.shape == (ray_count, config.density_samples_per_ray)
 
     # Compute segment probabilities for each ray.
@@ -404,88 +409,174 @@ def _rgb_from_points(
 
     # Render the most visible points for each ray, with weighted random sampling.
     assert probs.p_terminates.shape == (ray_count, config.density_samples_per_ray)
-    appearance_indices = jax.vmap(
-        lambda p: jax.random.choice(
+
+    global_weighted_sample = False
+    if global_weighted_sample:
+        appearance_indices = jax.random.choice(
             key=prng_key,
-            a=config.density_samples_per_ray,
-            shape=(config.appearance_samples_per_ray,),
+            a=ray_count * config.density_samples_per_ray,
+            shape=(ray_count * config.appearance_samples_per_ray,),
             replace=False,
-            p=p,
+            p=probs.p_terminates.reshape((-1,)),
         )
-    )(probs.p_terminates)
-    assert appearance_indices.shape == (ray_count, config.appearance_samples_per_ray)
+        visible_points = points.reshape((3, -1))[:, appearance_indices]
+        assert visible_points.shape == (
+            3,
+            ray_count * config.appearance_samples_per_ray,
+        )
+        appearance_tensor = learnable_params.appearance_tensor
+        appearance_feat = appearance_tensor.interpolate(visible_points)
+        appearance_feat = jnp.moveaxis(appearance_feat, 0, -1)
+        assert appearance_feat.shape == (
+            ray_count * config.appearance_samples_per_ray,
+            appearance_tensor.channel_dim(),
+        )
+        assert rays_wrt_world.directions.shape == (ray_count, 3)
+        viewdirs = rays_wrt_world.directions[
+            appearance_indices // config.density_samples_per_ray, :
+        ]
+        assert viewdirs.shape == (ray_count * config.appearance_samples_per_ray, 3)
 
-    visible_points = points[:, jnp.arange(ray_count)[:, None], appearance_indices]
-    assert visible_points.shape == (3, ray_count, config.appearance_samples_per_ray)
-
-    appearance_tensor = learnable_params.appearance_tensor
-    appearance_feat = appearance_tensor.interpolate(visible_points)
-    assert appearance_feat.shape == (
-        appearance_tensor.channel_dim(),
-        ray_count,
-        config.appearance_samples_per_ray,
-    )
-
-    total_sample_count = ray_count * config.appearance_samples_per_ray
-    appearance_feat = jnp.moveaxis(appearance_feat, 0, -1).reshape(
-        (total_sample_count, appearance_tensor.channel_dim())
-    )
-    viewdirs = jnp.tile(
-        rays_wrt_world.directions[:, None, :],
-        (1, config.appearance_samples_per_ray, 1),
-    ).reshape((-1, 3))
-
-    visible_rgb = cast(
-        jnp.ndarray,
-        appearance_mlp.apply(
-            learnable_params.appearance_mlp_params,
-            features=appearance_feat.reshape(
-                (ray_count * config.appearance_samples_per_ray, -1)
+        visible_rgb = cast(
+            jnp.ndarray,
+            appearance_mlp.apply(
+                learnable_params.appearance_mlp_params,
+                features=appearance_feat,
+                viewdirs=viewdirs,
+                dtype=dtype,
             ),
-            viewdirs=viewdirs,
-            dtype=dtype,
-        ),
-    ).reshape((ray_count, config.appearance_samples_per_ray, 3))
-
-    rgb = (
-        jnp.zeros(
-            (ray_count, config.density_samples_per_ray, 3),
-            dtype=dtype,
         )
-        .at[jnp.arange(ray_count)[:, None], appearance_indices, :]
-        .set(visible_rgb)
-    )
-    assert rgb.shape == (ray_count, config.density_samples_per_ray, 3)
+        assert visible_rgb.shape == (ray_count * config.appearance_samples_per_ray, 3)
 
-    # Coefficients for unbiasing the expected RGB values using the sampling
-    # probabilities. This is helpful because RGB values for points that are not chosen
-    # by our appearance sampler are zeroed out.
-    #
-    # As an example: if the weights* for all density samples is 0.95** but the sum of
-    # weights for our appearance samples is only 0.7, we can correct the resulting
-    # expected RGB value by scaling by (0.95/0.7).
-    #
-    # *weight at a segment = termination probability at that segment
-    # **equivalently: p=0.05 of the ray exiting the last segment and rendering the
-    # background.
-    sampled_p_terminates = probs.p_terminates[
-        jnp.arange(ray_count)[:, None], appearance_indices
-    ]
-    assert sampled_p_terminates.shape == (
-        ray_count,
-        config.appearance_samples_per_ray,
-    )
+        rgb = (
+            jnp.zeros(
+                (ray_count * config.density_samples_per_ray, 3),
+                dtype=dtype,
+            )
+            .at[appearance_indices, :]
+            .set(visible_rgb)
+            .reshape((ray_count, config.density_samples_per_ray, 3))
+        )
 
-    unbias_coeff = (
-        # The 0.95 term in the example.
-        1.0
-        - probs.p_exits[:, -1]
-        + utils.eps_from_dtype(dtype)
-    ) / (
-        # The 0.7 term in the example.
-        jnp.sum(sampled_p_terminates, axis=1)
-        + utils.eps_from_dtype(dtype)
-    )
-    assert unbias_coeff.shape == (ray_count,)
+        # Coefficients for unbiasing the expected RGB values using the sampling
+        # probabilities. This is helpful because RGB values for points that are not chosen
+        # by our appearance sampler are zeroed out.
+        #
+        # As an example: if the weights* for all density samples is 0.95** but the sum of
+        # weights for our appearance samples is only 0.7, we can correct the resulting
+        # expected RGB value by scaling by (0.95/0.7).
+        #
+        # *weight at a segment = termination probability at that segment
+        # **equivalently: p=0.05 of the ray exiting the last segment and rendering the
+        # background.
+        total_p_terminates = (
+            jnp.zeros((ray_count,))
+            .at[appearance_indices // config.density_samples_per_ray]
+            .add(
+                probs.p_terminates.reshape(
+                    (ray_count * config.density_samples_per_ray,)
+                )[appearance_indices]
+            )
+        )
+        assert total_p_terminates.shape == (ray_count,)
+        unbias_coeff = (
+            # The 0.95 term in the example.
+            1.0
+            - probs.p_exits[:, -1]
+            + utils.eps_from_dtype(dtype)
+        ) / (
+            # The 0.7 term in the example.
+            total_p_terminates
+            + utils.eps_from_dtype(dtype)
+        )
+        assert unbias_coeff.shape == (ray_count,)
+
+    else:
+        appearance_indices = jax.vmap(
+            lambda p: jax.random.choice(
+                key=prng_key,
+                a=config.density_samples_per_ray,
+                shape=(config.appearance_samples_per_ray,),
+                replace=False,
+                p=p,
+            )
+        )(probs.p_terminates)
+        assert appearance_indices.shape == (
+            ray_count,
+            config.appearance_samples_per_ray,
+        )
+
+        visible_points = points[:, jnp.arange(ray_count)[:, None], appearance_indices]
+        assert visible_points.shape == (3, ray_count, config.appearance_samples_per_ray)
+
+        appearance_tensor = learnable_params.appearance_tensor
+        appearance_feat = appearance_tensor.interpolate(visible_points)
+        assert appearance_feat.shape == (
+            appearance_tensor.channel_dim(),
+            ray_count,
+            config.appearance_samples_per_ray,
+        )
+
+        total_sample_count = ray_count * config.appearance_samples_per_ray
+        appearance_feat = jnp.moveaxis(appearance_feat, 0, -1).reshape(
+            (total_sample_count, appearance_tensor.channel_dim())
+        )
+        viewdirs = jnp.tile(
+            rays_wrt_world.directions[:, None, :],
+            (1, config.appearance_samples_per_ray, 1),
+        ).reshape((-1, 3))
+
+        visible_rgb = cast(
+            jnp.ndarray,
+            appearance_mlp.apply(
+                learnable_params.appearance_mlp_params,
+                features=appearance_feat.reshape(
+                    (ray_count * config.appearance_samples_per_ray, -1)
+                ),
+                viewdirs=viewdirs,
+                dtype=dtype,
+            ),
+        ).reshape((ray_count, config.appearance_samples_per_ray, 3))
+
+        rgb = (
+            jnp.zeros(
+                (ray_count, config.density_samples_per_ray, 3),
+                dtype=dtype,
+            )
+            .at[jnp.arange(ray_count)[:, None], appearance_indices, :]
+            .set(visible_rgb)
+        )
+        assert rgb.shape == (ray_count, config.density_samples_per_ray, 3)
+
+        # Coefficients for unbiasing the expected RGB values using the sampling
+        # probabilities. This is helpful because RGB values for points that are not chosen
+        # by our appearance sampler are zeroed out.
+        #
+        # As an example: if the weights* for all density samples is 0.95** but the sum of
+        # weights for our appearance samples is only 0.7, we can correct the resulting
+        # expected RGB value by scaling by (0.95/0.7).
+        #
+        # *weight at a segment = termination probability at that segment
+        # **equivalently: p=0.05 of the ray exiting the last segment and rendering the
+        # background.
+        sampled_p_terminates = probs.p_terminates[
+            jnp.arange(ray_count)[:, None], appearance_indices
+        ]
+        assert sampled_p_terminates.shape == (
+            ray_count,
+            config.appearance_samples_per_ray,
+        )
+
+        unbias_coeff = (
+            # The 0.95 term in the example.
+            1.0
+            - probs.p_exits[:, -1]
+            + utils.eps_from_dtype(dtype)
+        ) / (
+            # The 0.7 term in the example.
+            jnp.sum(sampled_p_terminates, axis=1)
+            + utils.eps_from_dtype(dtype)
+        )
+        assert unbias_coeff.shape == (ray_count,)
 
     return rgb, unbias_coeff
