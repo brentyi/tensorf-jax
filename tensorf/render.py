@@ -100,7 +100,7 @@ def render_rays(
     learnable_params: LearnableParams,
     aabb: jnp.ndarray,
     rays_wrt_world: cameras.Rays3D,
-    prng_key: Optional[jax.random.KeyArray],
+    prng_key: jax.random.KeyArray,
     config: RenderConfig,
     *,
     dtype: Any = jnp.float32,

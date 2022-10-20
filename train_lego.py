@@ -8,8 +8,8 @@ python train_lego.py --help
 
 import pathlib
 
-import dcargs
 import fifteen
+import tyro
 
 import tensorf.train_config
 import tensorf.training
@@ -36,7 +36,7 @@ if __name__ == "__main__":
     )
 
     # Parse arguments.
-    config = dcargs.cli(
+    config = tyro.cli(
         tensorf.train_config.TensorfConfig,
         default=lego_config,
     )

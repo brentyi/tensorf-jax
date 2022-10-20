@@ -12,12 +12,12 @@ python render_360.py --help
 import dataclasses
 import pathlib
 
-import dcargs
 import fifteen
 import jax
 import jax_dataclasses as jdc
 import jaxlie
 import numpy as onp
+import tyro
 from jax import numpy as jnp
 from PIL import Image
 
@@ -116,4 +116,4 @@ def main(args: Args) -> None:
 
 if __name__ == "__main__":
     fifteen.utils.pdb_safety_net()
-    main(dcargs.cli(Args))
+    main(tyro.cli(Args))

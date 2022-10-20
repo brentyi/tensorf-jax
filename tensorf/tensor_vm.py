@@ -216,7 +216,7 @@ def linear_interpolation_with_channel_axis(
     output = jax.vmap(
         lambda g: jax.scipy.ndimage.map_coordinates(
             g,
-            coordinates=coordinates,
+            coordinates=coordinates,  # type: ignore
             order=1,
             mode="nearest",
         )
