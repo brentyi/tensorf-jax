@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import math
 from typing import Tuple
 
@@ -29,16 +28,17 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     optimizer_state: optax.OptState
 
     # Current axis-aligned bounding box.
-    aabb: Annotated[jnp.ndarray, (2, 3)]
+    aabb: Annotated[jnp.ndarray, jnp.floating, (2, 3)]
 
     # Misc.
     prng_key: jax.random.KeyArray
-    step: int
+    step: Annotated[jnp.ndarray, jnp.integer, ()]
 
     @staticmethod
+    @jdc.jit
     def initialize(
-        config: train_config.TensorfConfig,
-        grid_dim: int,
+        config: jdc.Static[train_config.TensorfConfig],
+        grid_dim: jdc.Static[int],
         prng_key: jax.random.KeyArray,
     ) -> TrainState:
         prng_keys = jax.random.split(prng_key, 4)
@@ -88,10 +88,10 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             optimizer_state=optimizer_state,
             aabb=jnp.array([config.initial_aabb_min, config.initial_aabb_max]),
             prng_key=prng_keys[3],
-            step=0,
+            step=jnp.array(0),
         )
 
-    @functools.partial(jax.jit, donate_argnums=0)
+    @jdc.jit(donate_argnums=0)
     def training_step(
         self, minibatch: data.RenderedRays
     ) -> Tuple[TrainState, fifteen.experiments.TensorboardLogData]:
@@ -172,7 +172,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             grads,
         )
         assert jnp.issubdtype(
-            jax.tree_leaves(grads_unscaled)[0].dtype, jnp.float32
+            jax.tree_util.tree_leaves(grads_unscaled)[0].dtype, jnp.float32
         ), "Gradients should always be float32."
 
         # Compute learning rate decay.
@@ -349,7 +349,7 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
     print("Training with config:", config)
     loop_metrics: fifteen.utils.LoopMetrics
     for loop_metrics in tqdm(
-        fifteen.utils.range_with_metrics(config.n_iters - train_state.step),
+        fifteen.utils.range_with_metrics(config.n_iters - int(train_state.step)),
         desc="Training",
     ):
         # Load minibatch.
@@ -374,7 +374,7 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
         if train_step % 1000 == 0:
             experiment.save_checkpoint(
                 train_state,
-                step=train_state.step,
+                step=int(train_state.step),
                 keep_every_n_steps=2000,
             )
 

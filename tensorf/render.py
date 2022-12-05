@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import functools
 import math
 from typing import Any, Optional, Tuple, cast
 
@@ -94,16 +93,16 @@ def render_rays_batched(
     return out_concatenated.reshape(batch_axes + out_concatenated.shape[1:])
 
 
-@functools.partial(jax.jit, static_argnames=("appearance_mlp", "config", "dtype"))
+@jdc.jit
 def render_rays(
-    appearance_mlp: networks.FeatureMlp,
+    appearance_mlp: jdc.Static[networks.FeatureMlp],
     learnable_params: LearnableParams,
     aabb: jnp.ndarray,
     rays_wrt_world: cameras.Rays3D,
     prng_key: jax.random.KeyArray,
-    config: RenderConfig,
+    config: jdc.Static[RenderConfig],
     *,
-    dtype: Any = jnp.float32,
+    dtype: jdc.Static[Any] = jnp.float32,
 ) -> jnp.ndarray:
     """Render a set of rays.
 

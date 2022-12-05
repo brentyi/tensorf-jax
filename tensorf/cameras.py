@@ -1,5 +1,4 @@
-import functools
-from typing import Optional
+from typing import Union
 
 import jax
 import jax_dataclasses as jdc
@@ -34,8 +33,8 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         T_camera_world: jaxlie.SE3,
         image_width: int,
         image_height: int,
-        fov_x_radians: Optional[float] = None,
-        fov_y_radians: Optional[float] = None,
+        fov_x_radians: Union[float, jnp.ndarray, None] = None,
+        fov_y_radians: Union[float, jnp.ndarray, None] = None,
     ) -> "Camera":
         """Initialize camera parameters from FOV. At least one of `fov_x_radians` or
         `fov_y_radians` must be passed in."""
@@ -73,18 +72,20 @@ class Camera(jdc.EnforcedAnnotationsMixin):
             image_height=image_height,
         )
 
-    @jax.jit
-    def compute_fov_x_radians(self) -> float:
+    @jdc.jit
+    def compute_fov_x_radians(self) -> jnp.ndarray:
         fx = self.K[0, 0]
         return 2.0 * jnp.arctan((self.image_width / 2.0) / fx)
 
-    @jax.jit
-    def compute_fov_y_radians(self) -> float:
+    @jdc.jit
+    def compute_fov_y_radians(self) -> jnp.ndarray:
         fy = self.K[1, 1]
         return 2.0 * jnp.arctan((self.image_height / 2.0) / fy)
 
-    @functools.partial(jax.jit, static_argnums=(1, 2))
-    def resize_with_fixed_fov(self, image_width: int, image_height: int) -> "Camera":
+    @jdc.jit
+    def resize_with_fixed_fov(
+        self, image_width: jdc.Static[int], image_height: jdc.Static[int]
+    ) -> "Camera":
         return Camera.from_fov(
             self.T_camera_world,
             image_width=image_width,
@@ -93,7 +94,7 @@ class Camera(jdc.EnforcedAnnotationsMixin):
             fov_y_radians=self.compute_fov_y_radians(),
         )
 
-    @jax.jit
+    @jdc.jit
     def ray_wrt_world_from_uv(self, u: float, v: float) -> Rays3D:
         """Input is a scalar u/v coordinate. Output is a Rays struct, with origin and
         directions of shape (3,).,"""
@@ -115,7 +116,7 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         )
         return rays_wrt_world
 
-    @jax.jit
+    @jdc.jit
     def pixel_rays_wrt_world(self) -> Rays3D:
         """Get a length-3 vector for each pixel in image-space. Output shape is a ray
         structure with an origin field of shape `(image_height, image_width, 3)`, and

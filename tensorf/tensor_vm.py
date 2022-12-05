@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 from typing import Any, Callable, Tuple, Union
 
 import jax
@@ -92,8 +91,8 @@ class TensorVM:
         )
         return feature
 
-    @functools.partial(jax.jit, static_argnums=1)
-    def resize(self, grid_dim: int) -> TensorVM:
+    @jdc.jit
+    def resize(self, grid_dim: jdc.Static[int]) -> TensorVM:
         """Resize our tensor decomposition."""
 
         d: TensorVMSingle
@@ -184,8 +183,8 @@ class TensorVMSingle:
         assert c0 == c1
         return c0
 
-    @functools.partial(jax.jit, static_argnums=1)
-    def resize(self, grid_dim: int) -> TensorVMSingle:
+    @jdc.jit
+    def resize(self, grid_dim: jdc.Static[int]) -> TensorVMSingle:
         """Resize our decomposition, while interpolating linearly."""
 
         channel_dim = self.channel_dim()
@@ -216,7 +215,7 @@ def linear_interpolation_with_channel_axis(
     output = jax.vmap(
         lambda g: jax.scipy.ndimage.map_coordinates(
             g,
-            coordinates=coordinates,  # type: ignore
+            coordinates=tuple(coordinates),
             order=1,
             mode="nearest",
         )
