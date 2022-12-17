@@ -78,7 +78,6 @@ to JAX!
 
 ## To-do
 
-- [x] Blender dataloading
 - [x] Main implementation
   - [x] Point sampling
   - [x] Feature MLP
@@ -86,6 +85,12 @@ to JAX!
   - [x] VM decomposition
     - [x] Basic implementation
     - [x] Vectorized
+  - [x] Dataloading
+    - [x] Blender
+    - [x] nerfstudio
+  - [ ] Try real data
+    - [x] Scene contraction (~mip-NeRF 360)
+    - [ ] Camera embeddings
 - [x] Training
   - [x] Learning rate scheduler
     - [x] ADAM + grouped LR

@@ -20,7 +20,9 @@ import numpy as onp
 import tyro
 from jax import numpy as jnp
 from PIL import Image
+from typing_extensions import Literal, assert_never
 
+import tensorf.cameras
 import tensorf.data
 import tensorf.render
 import tensorf.train_config
@@ -45,6 +47,12 @@ class Args:
     appearance_samples_per_ray: int = 128
     ray_batch_size: int = 4096 * 4
 
+    render_width: int = 400
+    render_height: int = 400
+    render_fov_x: float = onp.pi / 2.0
+
+    rotation_axis: Literal["world_z", "camera_up"] = "camera_up"
+
 
 def main(args: Args) -> None:
     experiment = fifteen.experiments.Experiment(data_dir=args.run_dir)
@@ -63,10 +71,46 @@ def main(args: Args) -> None:
     assert train_state.step > 0
 
     # Load the training dataset... we're only going to use this to grab a camera.
-    train_views = tensorf.data.load_blender_dataset(
-        dataset_root=config.dataset_path, split="train", progress_bar=True
+    if config.dataset_type == "blender":
+        train_views = tensorf.data.load_blender_dataset(
+            config.dataset_path, split="train", progress_bar=True
+        )
+    elif config.dataset_type == "nerfstudio":
+        train_views = tensorf.data.load_nerfstudio_dataset(
+            config.dataset_path, progress_bar=True
+        )
+    else:
+        assert_never(config.dataset_type)
+
+    initial_T_camera_world = train_views[0].camera.T_camera_world
+    initial_T_camera_world = jaxlie.SE3.from_rotation_and_translation(
+        initial_T_camera_world.rotation(),
+        initial_T_camera_world.translation() * 0.8,
     )
-    camera = train_views[0].camera
+    camera = tensorf.cameras.Camera.from_fov(
+        T_camera_world=initial_T_camera_world,
+        image_width=args.render_width,
+        image_height=args.render_height,
+        fov_x_radians=args.render_fov_x,
+    )
+
+    # Get rotation axis.
+    if args.rotation_axis == "world_z":
+        rotation_axis = onp.array([0.0, 0.0, 1.0])
+    elif args.rotation_axis == "camera_up":
+        # In the OpenCV convention, the "camera up" is -Y.
+        up_vectors = onp.array(
+            [
+                view.camera.T_camera_world.rotation().inverse()
+                @ onp.array([0.0, -1.0, 0.0])
+                for view in train_views
+            ]
+        )
+        rotation_axis = onp.mean(up_vectors, axis=0)
+        rotation_axis /= onp.linalg.norm(rotation_axis)
+    else:
+        assert_never(args.rotation_axis)
+
     del train_views
 
     for i in range(args.frames):
@@ -80,8 +124,8 @@ def main(args: Args) -> None:
             rays_wrt_world=camera.pixel_rays_wrt_world(),
             prng_key=jax.random.PRNGKey(0),
             config=tensorf.render.RenderConfig(
-                near=0.1,
-                far=10.0,
+                near=0.05,
+                far=50.0,
                 mode=args.mode,
                 density_samples_per_ray=args.density_samples_per_ray,
                 appearance_samples_per_ray=args.appearance_samples_per_ray,
@@ -109,7 +153,7 @@ def main(args: Args) -> None:
             camera,
             T_camera_world=camera.T_camera_world
             @ jaxlie.SE3.from_rotation(
-                jaxlie.SO3.from_z_radians(2 * jnp.pi / args.frames)
+                jaxlie.SO3.exp(2 * jnp.pi / args.frames * rotation_axis)
             ),
         )
 

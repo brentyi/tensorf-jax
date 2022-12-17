@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from typing import Tuple
 
 import fifteen
@@ -10,7 +11,7 @@ import jax_dataclasses as jdc
 import optax
 from jax import numpy as jnp
 from tqdm.auto import tqdm
-from typing_extensions import Annotated
+from typing_extensions import Annotated, assert_never
 
 from . import data, networks, render, tensor_vm, train_config, utils
 
@@ -76,8 +77,11 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 prng_key=prng_keys[2],
                 dtype=jnp.float32,
             ),
+            scene_contraction=config.scene_contraction,
         )
-        optimizer = TrainState._make_optimizer(config.optimizer)
+        optimizer = TrainState._make_optimizer(
+            config.optimizer, config.scene_contraction
+        )
         optimizer_state = optimizer.init(learnable_params)
 
         return TrainState(
@@ -122,10 +126,10 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 rays_wrt_world=minibatch.rays_wrt_world,
                 prng_key=render_prng_key,
                 config=render.RenderConfig(
-                    # TODO: the near/far thresholds don't matter much since we fit rays
-                    # into the bounding box, but probably shouldn't be hardcoded.
-                    near=0.1,
-                    far=10.0,
+                    # TODO: the near/far thresholds don't matter much, but shouldn't be
+                    # hardcoded.
+                    near=0.05,
+                    far=50.0,
                     mode=render.RenderMode.RGB,
                     density_samples_per_ray=density_samples_per_ray,
                     appearance_samples_per_ray=appearance_samples_per_ray,
@@ -227,6 +231,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     @staticmethod
     def _make_optimizer(
         config: train_config.OptimizerConfig,
+        scene_contraction: bool,
     ) -> optax.GradientTransformation:
         """Set up Adam optimizer."""
         return optax.chain(
@@ -247,6 +252,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                     appearance_mlp_params=True,  # type: ignore
                     appearance_tensor=False,  # type: ignore
                     density_tensor=False,  # type: ignore
+                    scene_contraction=scene_contraction,
                 ),
             ),
             # Apply tensor decomposition learning rate. Note the negative sign needed
@@ -257,6 +263,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                     appearance_mlp_params=False,  # type: ignore
                     appearance_tensor=True,  # type: ignore
                     density_tensor=True,  # type: ignore
+                    scene_contraction=scene_contraction,
                 ),
             ),
         )
@@ -312,15 +319,22 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
     )
 
     # Load dataset.
-    assert config.dataset_type == "blender"
+    if config.dataset_type == "blender":
+        views = data.load_blender_dataset(
+            config.dataset_path,
+            split="train",
+            progress_bar=True,
+        )
+    elif config.dataset_type == "nerfstudio":
+        views = data.load_nerfstudio_dataset(
+            config.dataset_path,
+            progress_bar=True,
+        )
+    else:
+        assert_never(config.dataset_type)
+
     dataloader = fifteen.data.InMemoryDataLoader(
-        dataset=data.rendered_rays_from_views(
-            views=data.load_blender_dataset(
-                config.dataset_path,
-                split="train",
-                progress_bar=True,
-            )
-        ),
+        dataset=data.rendered_rays_from_views(views),
         minibatch_size=config.minibatch_size,
     )
     minibatches = fifteen.data.cycled_minibatches(dataloader, shuffle_seed=0)

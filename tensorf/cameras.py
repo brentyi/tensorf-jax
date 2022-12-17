@@ -116,7 +116,8 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         )
         return rays_wrt_world
 
-    @jdc.jit
+    # Hacky: JIT this on CPU. Currently used only for data generation.
+    @jdc.jit(device=jax.devices("cpu")[0])
     def pixel_rays_wrt_world(self) -> Rays3D:
         """Get a length-3 vector for each pixel in image-space. Output shape is a ray
         structure with an origin field of shape `(image_height, image_width, 3)`, and

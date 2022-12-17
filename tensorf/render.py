@@ -44,6 +44,7 @@ class LearnableParams:
     appearance_mlp_params: flax.core.FrozenDict
     appearance_tensor: tensor_vm.TensorVM
     density_tensor: tensor_vm.TensorVM
+    scene_contraction: jdc.Static[bool]
 
 
 def render_rays_batched(
@@ -117,18 +118,61 @@ def render_rays(
 
     sample_prng_key, render_rgb_prng_key = jax.random.split(prng_key)
 
-    points, ts, step_sizes = jax.vmap(
-        lambda ray: sample_points_along_ray(
-            ray_wrt_world=ray,
-            aabb=aabb,
-            samples_per_ray=config.density_samples_per_ray,
-            prng_key=sample_prng_key,
-        ),
-        out_axes=(1, 0, 0),
-    )(rays_wrt_world)
+    if learnable_params.scene_contraction:
+        # Contracted scene: sample linearly for close samples, then start spacing
+        # samples out. This is probably reasonable?
+        close_samples_per_ray = config.density_samples_per_ray // 2
+        far_samples_per_ray = config.density_samples_per_ray - close_samples_per_ray
+
+        close_ts = jnp.linspace(config.near, config.near + 1.0, close_samples_per_ray)
+        far_ts = 1.0 / (
+            2.0
+            - jnp.linspace(
+                config.near + 1.0 + (1.0 / close_samples_per_ray),
+                2.0 - 1.0 / config.far,
+                far_samples_per_ray,
+            )
+        )
+        ts = jnp.tile(jnp.concatenate([close_ts, far_ts])[None, :], reps=(ray_count, 1))
+
+        # Compute step sizes.
+        step_sizes = jnp.roll(ts, -1, axis=-1) - ts  # Naive. Could be improved
+        step_sizes = step_sizes.at[:, -1].set(step_sizes[:, -2])
+
+        # Jitter samples.
+        sample_jitter = jax.random.uniform(
+            sample_prng_key, shape=(ray_count, config.density_samples_per_ray)
+        )
+        ts = ts + step_sizes * sample_jitter
+
+        # Compute points in world space.
+        points = (
+            rays_wrt_world.origins[:, None, :]
+            + ts[:, :, None] * rays_wrt_world.directions[:, None, :]
+        )
+
+        # Contract points to cube.
+        norm = jnp.linalg.norm(points, ord=jnp.inf, axis=-1, keepdims=True)
+        points = jnp.where(norm <= 1.0, points, (2.0 - 1.0 / norm) * points / norm)
+        assert points.shape == (ray_count, config.density_samples_per_ray, 3)
+        points = jnp.moveaxis(points, -1, 0)
+    else:
+        # Bounded scene: we sample points uniformly between the camera origin and bounding
+        # box limit.
+        points, ts, step_sizes = jax.vmap(
+            lambda ray: sample_points_along_ray_within_bbox(
+                ray_wrt_world=ray,
+                aabb=aabb,
+                samples_per_ray=config.density_samples_per_ray,
+                prng_key=sample_prng_key,
+            ),
+            out_axes=(1, 0, 0),
+        )(rays_wrt_world)
+        step_sizes = jnp.tile(step_sizes[:, None], (1, config.density_samples_per_ray))
+
     assert points.shape == (3, ray_count, config.density_samples_per_ray)
     assert ts.shape == (ray_count, config.density_samples_per_ray)
-    assert step_sizes.shape == (ray_count,)
+    assert step_sizes.shape == (ray_count, config.density_samples_per_ray)
 
     # Normalize points to [-1, 1].
     points = (
@@ -244,7 +288,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
 
 
 def compute_segment_probabilities(
-    sigmas: jnp.ndarray, step_size: jnp.ndarray
+    sigmas: jnp.ndarray, step_sizes: jnp.ndarray
 ) -> SegmentProbabilities:
     r"""Compute some probabilities needed for rendering rays. Expects sigmas of shape
     (*, sample_count) and a per-ray step size of shape (*,).
@@ -262,10 +306,10 @@ def compute_segment_probabilities(
 
     # Support arbitrary leading batch axes.
     (*batch_axes, sample_count) = sigmas.shape
-    assert step_size.shape == (*batch_axes,)
+    assert step_sizes.shape == (*batch_axes, sample_count)
 
     # Equation 1.
-    neg_scaled_sigmas = -sigmas * step_size[..., None]
+    neg_scaled_sigmas = -sigmas * step_sizes
     p_exits = jnp.exp(jnp.cumsum(neg_scaled_sigmas, axis=-1))
     assert p_exits.shape == (*batch_axes, sample_count)
 
@@ -293,7 +337,7 @@ def compute_segment_probabilities(
     )
 
 
-def sample_points_along_ray(
+def sample_points_along_ray_within_bbox(
     ray_wrt_world: cameras.Rays3D,
     aabb: jnp.ndarray,
     samples_per_ray: int,
@@ -331,6 +375,8 @@ def sample_points_along_ray(
         ray_wrt_world.origins[:, None] + ray_wrt_world.directions[:, None] * ts[None, :]
     )
     assert points.shape == (3, samples_per_ray)
+    assert ts.shape == (samples_per_ray,)
+    assert step_size.shape == ()
     return points, ts, step_size
 
 

@@ -19,8 +19,8 @@ class TensorfConfig:
     # Input data directory.
     dataset_path: pathlib.Path
 
-    # Currently unused; only blender datasets are supported right now.
-    dataset_type: Literal["blender"] = "blender"
+    # Dataset type.
+    dataset_type: Literal["blender", "nerfstudio"] = "blender"
 
     # Training options.
     minibatch_size: int = 4096
@@ -73,3 +73,6 @@ class TensorfConfig:
     # but can run slower despite a nearly identical computation graph. (possibly due to
     # some reduced sparsity of gradients?)
     loss_scale: float = 1.0
+
+    # Apply MipNeRF-360-inspired scene contraction. Useful for real data.
+    scene_contraction: bool = False
