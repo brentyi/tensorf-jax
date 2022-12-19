@@ -15,6 +15,9 @@ class Rays3D(jdc.EnforcedAnnotationsMixin):
 
     origins: Annotated[jnp.ndarray, (3,), jnp.floating]
     directions: Annotated[jnp.ndarray, (3,), jnp.floating]
+    camera_indices: Annotated[
+        jnp.ndarray, (), jnp.uint32
+    ]  # Used for per-camera appearance embeddings.
 
 
 @jdc.pytree_dataclass
@@ -95,7 +98,7 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         )
 
     @jdc.jit
-    def ray_wrt_world_from_uv(self, u: float, v: float) -> Rays3D:
+    def ray_wrt_world_from_uv(self, u: float, v: float, camera_index: int) -> Rays3D:
         """Input is a scalar u/v coordinate. Output is a Rays struct, with origin and
         directions of shape (3,).,"""
 
@@ -113,12 +116,13 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         rays_wrt_world = Rays3D(
             origins=T_world_camera.translation(),  # type: ignore
             directions=ray_direction_wrt_world,
+            camera_indices=jnp.array(camera_index, dtype=jnp.uint32),
         )
         return rays_wrt_world
 
     # Hacky: JIT this on CPU. Currently used only for data generation.
     @jdc.jit(device=jax.devices("cpu")[0])
-    def pixel_rays_wrt_world(self) -> Rays3D:
+    def pixel_rays_wrt_world(self, camera_index: int) -> Rays3D:
         """Get a length-3 vector for each pixel in image-space. Output shape is a ray
         structure with an origin field of shape `(image_height, image_width, 3)`, and
         direction field of shape `(image_height, image_width, 3)`."""
@@ -132,6 +136,8 @@ class Camera(jdc.EnforcedAnnotationsMixin):
         assert u.shape == v.shape == (image_height, image_width)
 
         # Compute world-space rays.
-        rays_wrt_world = jax.vmap(jax.vmap(self.ray_wrt_world_from_uv))(u, v)
+        rays_wrt_world = jax.vmap(
+            jax.vmap(lambda u, v: self.ray_wrt_world_from_uv(u, v, camera_index))
+        )(u, v)
         assert rays_wrt_world.get_batch_axes() == (image_height, image_width)
         return rays_wrt_world

@@ -41,8 +41,9 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         config: jdc.Static[train_config.TensorfConfig],
         grid_dim: jdc.Static[int],
         prng_key: jax.random.KeyArray,
+        num_cameras: jdc.Static[int],
     ) -> TrainState:
-        prng_keys = jax.random.split(prng_key, 4)
+        prng_keys = jax.random.split(prng_key, 5)
         normal_init = jax.nn.initializers.normal(stddev=0.1)
 
         def make_mlp() -> Tuple[networks.FeatureMlp, flax.core.FrozenDict]:
@@ -51,11 +52,16 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             appearance_mlp = networks.FeatureMlp(
                 feature_n_freqs=config.feature_n_freqs,
                 viewdir_n_freqs=config.viewdir_n_freqs,
+                # If num_cameras is set, camera embeddings are enabled.
+                num_cameras=num_cameras if config.camera_embeddings else None,
             )
+            dummy_camera_indices = jnp.zeros((1,), dtype=jnp.uint32)
+
             appearance_mlp_params = appearance_mlp.init(
                 prng_keys[0],
                 features=dummy_features,
                 viewdirs=dummy_viewdirs,
+                camera_indices=dummy_camera_indices,
             )
             return appearance_mlp, appearance_mlp_params
 
@@ -91,7 +97,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             optimizer=optimizer,
             optimizer_state=optimizer_state,
             aabb=jnp.array([config.initial_aabb_min, config.initial_aabb_max]),
-            prng_key=prng_keys[3],
+            prng_key=prng_keys[4],
             step=jnp.array(0),
         )
 
@@ -115,7 +121,9 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             # TODO: move heuristics into config?
             grid_dim = self.learnable_params.appearance_tensor.grid_dim()
             assert grid_dim == self.learnable_params.density_tensor.grid_dim()
-            density_samples_per_ray = int(math.sqrt(3 * grid_dim**2))
+            density_samples_per_ray = int(
+                math.sqrt(3 * grid_dim**2) * self.config.train_ray_sample_multiplier
+            )
             appearance_samples_per_ray = int(0.15 * density_samples_per_ray)
 
             # Render and compute loss.
@@ -126,10 +134,8 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 rays_wrt_world=minibatch.rays_wrt_world,
                 prng_key=render_prng_key,
                 config=render.RenderConfig(
-                    # TODO: the near/far thresholds don't matter much, but shouldn't be
-                    # hardcoded.
-                    near=0.05,
-                    far=50.0,
+                    near=self.config.render_near,
+                    far=self.config.render_far,
                     mode=render.RenderMode.RGB,
                     density_samples_per_ray=density_samples_per_ray,
                     appearance_samples_per_ray=appearance_samples_per_ray,
@@ -302,13 +308,33 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         return resized
 
 
-def run_training_loop(config: train_config.TensorfConfig) -> None:
+def run_training_loop(
+    config: train_config.TensorfConfig,
+    restore_checkpoint: bool = False,
+    clear_existing: bool = False,
+) -> None:
     """Full training loop implementation."""
 
     # Set up our experiment: for checkpoints, logs, metadata, etc.
     experiment = fifteen.experiments.Experiment(data_dir=config.run_dir)
-    experiment.clear()
-    experiment.write_metadata("config", config)
+    if restore_checkpoint:
+        experiment.assert_exists()
+        config = experiment.read_metadata("config", train_config.TensorfConfig)
+    else:
+        if clear_existing:
+            experiment.clear()
+        else:
+            experiment.assert_new()
+        experiment.write_metadata("config", config)
+
+    # Load dataset.
+    dataset = data.make_dataset(
+        config.dataset_type,
+        config.dataset_path,
+        config.scene_scale,
+    )
+    num_cameras = len(dataset.get_cameras())
+    experiment.write_metadata("num_cameras", num_cameras)
 
     # Initialize training state.
     train_state: TrainState
@@ -316,48 +342,17 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
         config,
         grid_dim=config.grid_dim_init,
         prng_key=jax.random.PRNGKey(94709),
+        num_cameras=num_cameras,
     )
-
-    # Load dataset.
-    if config.dataset_type == "blender":
-        views = data.load_blender_dataset(
-            config.dataset_path,
-            split="train",
-            progress_bar=True,
-        )
-    elif config.dataset_type == "nerfstudio":
-        views = data.load_nerfstudio_dataset(
-            config.dataset_path,
-            progress_bar=True,
-        )
-    else:
-        assert_never(config.dataset_type)
+    if restore_checkpoint:
+        train_state = experiment.restore_checkpoint(train_state)
 
     dataloader = fifteen.data.InMemoryDataLoader(
-        dataset=data.rendered_rays_from_views(views),
+        dataset=dataset.get_training_rays(),
         minibatch_size=config.minibatch_size,
     )
     minibatches = fifteen.data.cycled_minibatches(dataloader, shuffle_seed=0)
     minibatches = iter(minibatches)
-
-    # Totally optional: frontload JIT compile time. This just prevents training from
-    # pausing in the middle to re-JIT for different grid dimensions.
-    frontload_jit_compile_time = False
-    if frontload_jit_compile_time:
-        for upsamp_index in tqdm(
-            range(-1, len(config.upsamp_iters)), desc="JIT training step"
-        ):
-            grid_dim = int(
-                config.grid_dim_init
-                + (config.grid_dim_final - config.grid_dim_init)
-                * ((upsamp_index + 1) / len(config.upsamp_iters))
-            )
-            TrainState.initialize(
-                config,
-                grid_dim=grid_dim,
-                prng_key=jax.random.PRNGKey(94709),
-            ).training_step(next(iter(minibatches)))
-    del frontload_jit_compile_time
 
     # Run!
     print("Training with config:", config)
@@ -369,7 +364,7 @@ def run_training_loop(config: train_config.TensorfConfig) -> None:
         # Load minibatch.
         minibatch = next(minibatches)
         assert minibatch.get_batch_axes() == (config.minibatch_size,)
-        assert minibatch.colors.shape == (4096, 3)
+        assert minibatch.colors.shape == (config.minibatch_size, 3)
 
         # Training step.
         log_data: fifteen.experiments.TensorboardLogData

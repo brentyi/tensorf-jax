@@ -20,6 +20,18 @@ results after 5~10 minutes of training:
 
 ![Lego rendering GIF](./lego_render.gif)
 
+As proposed, TensoRF only supports scenes that fit in a fixed-size bounding box.
+We've also added basic support for unbounded "real" scenes via mip-NeRF
+360-inspired scene contraction[^1]. From
+[nerfstudio](https://github.com/nerfstudio-project/nerfstudio)'s "dozer"
+dataset:
+
+![Dozer rendering GIF](./dozer_render.gif)
+
+[^1]:
+    Same as [the original](https://jonbarron.info/mipnerf360/), but with an
+    $L-\infty$ norm instead of $L-2$ norm.
+
 ## Instructions
 
 1. Download `nerf_synthetic` dataset:
@@ -46,7 +58,7 @@ results after 5~10 minutes of training:
    tensorboard --logdir=./runs/
    ```
 
-5. To generate some renders, visit `./render.ipynb` in Jupyter. Or:
+5. To render:
 
    ```bash
    python ./render_360.py --help
@@ -88,9 +100,13 @@ to JAX!
   - [x] Dataloading
     - [x] Blender
     - [x] nerfstudio
-  - [ ] Try real data
+      - [x] Basics
+      - [x] Fisheye support
+      - [x] Compute samples without undistorting images (throws away a lot of
+            pixels)
+  - [x] Tricks for real data
     - [x] Scene contraction (~mip-NeRF 360)
-    - [ ] Camera embeddings
+    - [x] Camera embeddings
 - [x] Training
   - [x] Learning rate scheduler
     - [x] ADAM + grouped LR
@@ -103,6 +119,7 @@ to JAX!
     - [x] PSNR
     - [ ] Test metrics
     - [ ] Test images
+    - [ ] Render previews
   - [ ] Ray filtering
   - [ ] Bounding box refinement
   - [x] Incremental upsampling

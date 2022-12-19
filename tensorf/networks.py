@@ -1,7 +1,7 @@
 """Neural networks for volumetric rendering."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from flax import linen as nn
 from jax import numpy as jnp
@@ -42,12 +42,14 @@ class FeatureMlp(nn.Module):
     units: int = 128
     feature_n_freqs: int = 6
     viewdir_n_freqs: int = 6
+    num_cameras: Optional[int] = None  # Set to enable camera embeddings.
 
     @nn.compact
     def __call__(  # type: ignore
         self,
         features: jnp.ndarray,
         viewdirs: jnp.ndarray,
+        camera_indices: jnp.ndarray,
         # Computation dtype. Main parameters will always be float32.
         dtype: Any = jnp.float32,
     ) -> jnp.ndarray:
@@ -102,6 +104,18 @@ class FeatureMlp(nn.Module):
         )(x)
         x = nn.relu(x)
         assert x.shape == (*batch_axes, self.units)
+
+        # Add FiLM-style conditioning for camera embeddings.
+        # This is different from (and may be worse than) what published works do.
+        if self.num_cameras is not None:
+            conditioner = nn.Embed(
+                num_embeddings=self.num_cameras, features=self.units
+            )(camera_indices)
+            assert conditioner.shape == (*batch_axes, self.units)
+            x = x.at[..., self.units // 2 :].set(
+                conditioner[..., : self.units // 2] * x[..., self.units // 2 :]
+                + conditioner[..., self.units // 2 :]
+            )
 
         # Layer 3.
         x = nn.Dense(

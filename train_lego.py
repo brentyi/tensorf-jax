@@ -6,6 +6,7 @@ python train_lego.py --help
 ```
 """
 
+import functools
 import pathlib
 
 import fifteen
@@ -19,7 +20,7 @@ if __name__ == "__main__":
     fifteen.utils.pdb_safety_net()
 
     # Default configuration for lego dataset.
-    lego_config = tensorf.train_config.TensorfConfig(
+    default_config = tensorf.train_config.TensorfConfig(
         run_dir=pathlib.Path(f"./runs/lego-{fifteen.utils.timestamp()}"),
         dataset_path=pathlib.Path("./data/nerf_synthetic/lego"),
         dataset_type="blender",
@@ -35,11 +36,11 @@ if __name__ == "__main__":
         upsamp_iters=(2000, 3000, 4000, 5500, 7000),
     )
 
-    # Parse arguments.
-    config = tyro.cli(
-        tensorf.train_config.TensorfConfig,
-        default=lego_config,
+    # Run training loop! Note that we can set a default value for a function via
+    # `functools.partial()`.
+    tyro.cli(
+        functools.partial(
+            tensorf.training.run_training_loop,
+            config=default_config,
+        )
     )
-
-    # Run training loop!
-    tensorf.training.run_training_loop(config)

@@ -12,6 +12,7 @@ python render_360.py --help
 import dataclasses
 import pathlib
 
+import cv2
 import fifteen
 import jax
 import jax_dataclasses as jdc
@@ -50,6 +51,8 @@ class Args:
     render_width: int = 400
     render_height: int = 400
     render_fov_x: float = onp.pi / 2.0
+    render_camera_index: int = 0
+    """Camera embedding to use, if enabled."""
 
     rotation_axis: Literal["world_z", "camera_up"] = "camera_up"
 
@@ -66,23 +69,20 @@ def main(args: Args) -> None:
         config=config,
         grid_dim=config.grid_dim_final,
         prng_key=jax.random.PRNGKey(0),
+        num_cameras=experiment.read_metadata("num_cameras", int),
     )
     train_state = experiment.restore_checkpoint(train_state)
     assert train_state.step > 0
 
     # Load the training dataset... we're only going to use this to grab a camera.
-    if config.dataset_type == "blender":
-        train_views = tensorf.data.load_blender_dataset(
-            config.dataset_path, split="train", progress_bar=True
-        )
-    elif config.dataset_type == "nerfstudio":
-        train_views = tensorf.data.load_nerfstudio_dataset(
-            config.dataset_path, progress_bar=True
-        )
-    else:
-        assert_never(config.dataset_type)
+    dataset = tensorf.data.make_dataset(
+        config.dataset_type,
+        config.dataset_path,
+        config.scene_scale,
+    )
+    train_cameras = dataset.get_cameras()
 
-    initial_T_camera_world = train_views[0].camera.T_camera_world
+    initial_T_camera_world = train_cameras[0].T_camera_world
     initial_T_camera_world = jaxlie.SE3.from_rotation_and_translation(
         initial_T_camera_world.rotation(),
         initial_T_camera_world.translation() * 0.8,
@@ -101,9 +101,8 @@ def main(args: Args) -> None:
         # In the OpenCV convention, the "camera up" is -Y.
         up_vectors = onp.array(
             [
-                view.camera.T_camera_world.rotation().inverse()
-                @ onp.array([0.0, -1.0, 0.0])
-                for view in train_views
+                camera.T_camera_world.rotation().inverse() @ onp.array([0.0, -1.0, 0.0])
+                for camera in train_cameras
             ]
         )
         rotation_axis = onp.mean(up_vectors, axis=0)
@@ -111,7 +110,11 @@ def main(args: Args) -> None:
     else:
         assert_never(args.rotation_axis)
 
-    del train_views
+    del train_cameras
+
+    # Used for distance rendering.
+    min_invdist = None
+    max_invdist = None
 
     for i in range(args.frames):
         print(f"Rendering frame {i + 1}/{args.frames}")
@@ -121,11 +124,13 @@ def main(args: Args) -> None:
             appearance_mlp=train_state.appearance_mlp,
             learnable_params=train_state.learnable_params,
             aabb=train_state.aabb,
-            rays_wrt_world=camera.pixel_rays_wrt_world(),
+            rays_wrt_world=camera.pixel_rays_wrt_world(
+                camera_index=args.render_camera_index
+            ),
             prng_key=jax.random.PRNGKey(0),
             config=tensorf.render.RenderConfig(
-                near=0.05,
-                far=50.0,
+                near=config.render_near,
+                far=config.render_far,
                 mode=args.mode,
                 density_samples_per_ray=args.density_samples_per_ray,
                 appearance_samples_per_ray=args.appearance_samples_per_ray,
@@ -137,15 +142,23 @@ def main(args: Args) -> None:
             image = onp.array(rendered)
             image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
         else:
-            # Depth: (H, W)
+            # Visualizing rendered distances: (H, W)
+            # For this we use inverse distances, which is similar to disparity.
             image = onp.array(rendered)
 
             # Visualization heuristics for "depths".
             image = 1.0 / onp.maximum(image, 1e-4)
-            image -= 0.15
-            image *= 5.0
+
+            # Compute scaling terms using first frame.
+            if min_invdist is None or max_invdist is None:
+                min_invdist = image.min()
+                max_invdist = image.max() * 0.9
+
+            image -= min_invdist
+            image /= max_invdist - min_invdist
             image = onp.clip(image * 255.0, 0.0, 255.0).astype(onp.uint8)
             image = onp.tile(image[:, :, None], reps=(1, 1, 3))
+
         Image.fromarray(image).save(args.output_dir / f"image_{i:03}.png")
 
         # Rotate camera.

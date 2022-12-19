@@ -76,3 +76,12 @@ class TensorfConfig:
 
     # Apply MipNeRF-360-inspired scene contraction. Useful for real data.
     scene_contraction: bool = False
+    scene_scale: float = 1.0
+
+    # Add NeRF in the wild-inspired camera embeddings.
+    camera_embeddings: bool = False
+
+    # Near and far limits for rendering.
+    render_near: float = 0.05
+    render_far: float = 200.0
+    train_ray_sample_multiplier: float = 1.0

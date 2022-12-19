@@ -64,7 +64,13 @@ def render_rays_batched(
 
     Possibly this could just take the training state directly as input."""
     batch_axes = rays_wrt_world.get_batch_axes()
-    rays_wrt_world = jax.tree_map(lambda x: x.reshape((-1, 3)), rays_wrt_world)
+    rays_wrt_world = (
+        cameras.Rays3D(  # TODO: feels like this could be done less manually!
+            origins=rays_wrt_world.origins.reshape((-1, 3)),
+            directions=rays_wrt_world.directions.reshape((-1, 3)),
+            camera_indices=rays_wrt_world.camera_indices.reshape((-1,)),
+        )
+    )
     (total_rays,) = rays_wrt_world.get_batch_axes()
 
     processed = 0
@@ -111,7 +117,8 @@ def render_rays(
 
     # Cast everything to the desired dtype.
     learnable_params, aabb, rays_wrt_world = jax.tree_map(
-        lambda x: x.astype(dtype), (learnable_params, aabb, rays_wrt_world)
+        lambda x: x.astype(dtype) if jnp.issubdtype(jnp.floating, dtype) else x,
+        (learnable_params, aabb, rays_wrt_world),
     )
 
     (ray_count,) = rays_wrt_world.get_batch_axes()
@@ -120,19 +127,33 @@ def render_rays(
 
     if learnable_params.scene_contraction:
         # Contracted scene: sample linearly for close samples, then start spacing
-        # samples out. This is probably reasonable?
+        # samples out.
+        #
+        # An occupancy grid or proposal network would really help us here!
         close_samples_per_ray = config.density_samples_per_ray // 2
         far_samples_per_ray = config.density_samples_per_ray - close_samples_per_ray
 
         close_ts = jnp.linspace(config.near, config.near + 1.0, close_samples_per_ray)
-        far_ts = 1.0 / (
-            2.0
-            - jnp.linspace(
-                config.near + 1.0 + (1.0 / close_samples_per_ray),
-                2.0 - 1.0 / config.far,
-                far_samples_per_ray,
+
+        # Some heuristics for sampling far points, which should be close to sampling
+        # linearly in disparity when k=1. This is probably reasonable, but it'd be a
+        # good idea to look at what real NeRF codebases do.
+        far_start = config.near + 1.0 + 1.0 / close_samples_per_ray
+        k = 10.0
+        far_deltas = (
+            1.0
+            / (
+                1.0
+                - onp.linspace(  # onp here is important for float64.
+                    0.0,
+                    1.0 - 1 / ((config.far - far_start) / k + 1),
+                    far_samples_per_ray,
+                )
             )
-        )
+            - 1.0
+        ) * onp.linspace(1.0, k, far_samples_per_ray)
+        far_ts = far_start + far_deltas
+
         ts = jnp.tile(jnp.concatenate([close_ts, far_ts])[None, :], reps=(ray_count, 1))
 
         # Compute step sizes.
@@ -480,6 +501,13 @@ def _rgb_from_points(
         (1, config.appearance_samples_per_ray, 1),
     ).reshape((-1, 3))
 
+    camera_indices = rays_wrt_world.camera_indices
+    assert camera_indices.shape == (ray_count,)
+    camera_indices = jnp.repeat(
+        camera_indices, repeats=config.appearance_samples_per_ray, axis=0
+    )
+    assert camera_indices.shape == (ray_count * config.appearance_samples_per_ray,)
+
     visible_rgb = cast(
         jnp.ndarray,
         appearance_mlp.apply(
@@ -488,6 +516,7 @@ def _rgb_from_points(
                 (ray_count * config.appearance_samples_per_ray, -1)
             ),
             viewdirs=viewdirs,
+            camera_indices=camera_indices,
             dtype=dtype,
         ),
     ).reshape((ray_count, config.appearance_samples_per_ray, 3))
