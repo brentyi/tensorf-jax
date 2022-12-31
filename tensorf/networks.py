@@ -42,6 +42,7 @@ class FeatureMlp(nn.Module):
     units: int = 128
     feature_n_freqs: int = 6
     viewdir_n_freqs: int = 6
+    output_dim: int = 3  # Generally: 3 for RGB, 4 for RGB + density.
     num_cameras: Optional[int] = None  # Set to enable camera embeddings.
 
     @nn.compact
@@ -119,11 +120,10 @@ class FeatureMlp(nn.Module):
 
         # Layer 3.
         x = nn.Dense(
-            features=3,
+            features=self.output_dim,
             kernel_init=linear_layer_init,
             dtype=dtype,
         )(x)
-        assert x.shape == (*batch_axes, 3)
+        assert x.shape == (*batch_axes, self.output_dim)
 
-        rgb = nn.sigmoid(x)
-        return rgb
+        return x

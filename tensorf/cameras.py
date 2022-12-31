@@ -19,6 +19,19 @@ class Rays3D(jdc.EnforcedAnnotationsMixin):
         jnp.ndarray, (), jnp.uint32
     ]  # Used for per-camera appearance embeddings.
 
+    def points_from_ts(self, ts: jnp.ndarray) -> jnp.ndarray:
+        """Given an array of scalar distances of shape (*batch_axes, num_samples),
+        compute a set of points of shape (*batch_axes, num_samples, 3)."""
+
+        num_samples = ts.shape[-1]
+        assert ts.shape == (*self.get_batch_axes(), num_samples)
+        points = (
+            self.origins[..., None, :]
+            + ts[..., :, None] * self.directions[..., None, :]
+        )
+        assert points.shape == (*self.get_batch_axes(), num_samples, 3)
+        return points
+
 
 @jdc.pytree_dataclass
 class Camera(jdc.EnforcedAnnotationsMixin):

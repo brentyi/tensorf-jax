@@ -55,8 +55,14 @@ class TensorfConfig:
     grid_dim_final: int = 300  # cbrt(N_voxel_final)
     upsamp_iters: Tuple[int, ...] = (2000, 3000, 4000, 5500, 7000)
 
-    # TODO: unimplemented. (can we even implement this in JAX?)
+    # TODO: unimplemented.
     # update_alphamask_iters: Tuple[int, ...] = (2000, 4000)
+
+    #
+    # ---------------------------
+    # Below, features that aren't present in the original TensoRF paper. This is mostly
+    # focused on mixed precision and real scenes.
+    #
 
     # If enabled, we use mixed-precision training. This seems to work and speeds up
     # training throughput by a significant factor, but is disabled by default because we
@@ -74,8 +80,9 @@ class TensorfConfig:
     # some reduced sparsity of gradients?)
     loss_scale: float = 1.0
 
-    # Apply MipNeRF-360-inspired scene contraction. Useful for real data.
-    scene_contraction: bool = False
+    # For unbounded scenes, we apply MipNeRF-360-inspired scene contraction. Useful for
+    # real data.
+    bounded_scene: bool = True
     scene_scale: float = 1.0
 
     # Add NeRF in the wild-inspired camera embeddings.
@@ -85,3 +92,11 @@ class TensorfConfig:
     render_near: float = 0.05
     render_far: float = 200.0
     train_ray_sample_multiplier: float = 1.0
+
+    # Proposal networks.
+    density_from_appearance_mlp = True
+    sampling_strategy: Literal["proposal_tensors"] = ""
+
+
+    #
+    resample_anneal: bool

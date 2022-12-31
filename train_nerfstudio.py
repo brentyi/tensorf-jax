@@ -35,7 +35,7 @@ if __name__ == "__main__":
         grid_dim_init=128,
         grid_dim_final=300,
         upsamp_iters=(2_500, 5_000, 10_000),
-        scene_contraction=True,
+        bounded_scene=False,
         camera_embeddings=True,
         render_near=0.05,
         render_far=200.0,

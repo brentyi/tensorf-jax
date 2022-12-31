@@ -13,7 +13,15 @@ from jax import numpy as jnp
 from tqdm.auto import tqdm
 from typing_extensions import Annotated, assert_never
 
-from . import data, networks, render, tensor_vm, train_config, utils
+from . import (
+    data,
+    networks,
+    render_bounded,
+    render_common,
+    tensor_vm,
+    train_config,
+    utils,
+)
 
 
 @jdc.pytree_dataclass
@@ -22,7 +30,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
     # Representation/parameters.
     appearance_mlp: jdc.Static[networks.FeatureMlp]
-    learnable_params: render.LearnableParams
+    learnable_params: render_common.LearnableParams
 
     # Optimizer.
     optimizer: jdc.Static[optax.GradientTransformation]
@@ -54,6 +62,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 viewdir_n_freqs=config.viewdir_n_freqs,
                 # If num_cameras is set, camera embeddings are enabled.
                 num_cameras=num_cameras if config.camera_embeddings else None,
+                output_dim=3,
             )
             dummy_camera_indices = jnp.zeros((1,), dtype=jnp.uint32)
 
@@ -67,7 +76,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
         appearance_mlp, appearance_mlp_params = make_mlp()
 
-        learnable_params = render.LearnableParams(
+        learnable_params = render_common.LearnableParams(
             appearance_mlp_params=appearance_mlp_params,
             appearance_tensor=tensor_vm.TensorVM.initialize(
                 grid_dim=grid_dim,
@@ -76,18 +85,18 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 prng_key=prng_keys[1],
                 dtype=jnp.float32,  # Main copy of parameters are always float32.
             ),
-            density_tensor=tensor_vm.TensorVM.initialize(
-                grid_dim=grid_dim,
-                per_axis_channel_dim=config.density_feat_dim,
-                init=normal_init,
-                prng_key=prng_keys[2],
-                dtype=jnp.float32,
+            density_tensors=(
+                tensor_vm.TensorVM.initialize(
+                    grid_dim=grid_dim,
+                    per_axis_channel_dim=config.density_feat_dim,
+                    init=normal_init,
+                    prng_key=prng_keys[2],
+                    dtype=jnp.float32,
+                ),
             ),
-            scene_contraction=config.scene_contraction,
+            bounded_scene=config.bounded_scene,
         )
-        optimizer = TrainState._make_optimizer(
-            config.optimizer, config.scene_contraction
-        )
+        optimizer = TrainState._make_optimizer(config.optimizer, config.bounded_scene)
         optimizer_state = optimizer.init(learnable_params)
 
         return TrainState(
@@ -115,29 +124,29 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             compute_dtype = jnp.float32
 
         def compute_loss(
-            learnable_params: render.LearnableParams,
+            learnable_params: render_common.LearnableParams,
         ) -> Tuple[jnp.ndarray, fifteen.experiments.TensorboardLogData]:
             # Compute sample counts from grid dimensionality.
             # TODO: move heuristics into config?
             grid_dim = self.learnable_params.appearance_tensor.grid_dim()
-            assert grid_dim == self.learnable_params.density_tensor.grid_dim()
+            assert grid_dim == self.learnable_params.density_tensors[0].grid_dim()
             density_samples_per_ray = int(
                 math.sqrt(3 * grid_dim**2) * self.config.train_ray_sample_multiplier
             )
             appearance_samples_per_ray = int(0.15 * density_samples_per_ray)
 
             # Render and compute loss.
-            rendered = render.render_rays(
+            rendered = render_bounded.render_rays(
                 appearance_mlp=self.appearance_mlp,
                 learnable_params=learnable_params,
                 aabb=self.aabb,
                 rays_wrt_world=minibatch.rays_wrt_world,
                 prng_key=render_prng_key,
-                config=render.RenderConfig(
+                config=render_common.RenderConfig(
                     near=self.config.render_near,
                     far=self.config.render_far,
-                    mode=render.RenderMode.RGB,
-                    density_samples_per_ray=density_samples_per_ray,
+                    mode=render_common.RenderMode.RGB,
+                    density_samples_per_ray=(density_samples_per_ray,),
                     appearance_samples_per_ray=appearance_samples_per_ray,
                 ),
                 dtype=compute_dtype,
@@ -164,7 +173,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
         # Compute gradients.
         log_data: fifteen.experiments.TensorboardLogData
-        grads: render.LearnableParams
+        grads: render_common.LearnableParams
         learnable_params = jax.tree_map(
             # Cast parameters to desired precision.
             lambda x: x.astype(compute_dtype),
@@ -237,7 +246,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     @staticmethod
     def _make_optimizer(
         config: train_config.OptimizerConfig,
-        scene_contraction: bool,
+        bounded_scene: bool,
     ) -> optax.GradientTransformation:
         """Set up Adam optimizer."""
         return optax.chain(
@@ -254,22 +263,22 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             # gradient descent.
             optax.masked(
                 optax.scale(-config.lr_init_mlp),
-                mask=render.LearnableParams(
+                mask=render_common.LearnableParams(
                     appearance_mlp_params=True,  # type: ignore
                     appearance_tensor=False,  # type: ignore
-                    density_tensor=False,  # type: ignore
-                    scene_contraction=scene_contraction,
+                    density_tensors=False,  # type: ignore
+                    bounded_scene=bounded_scene,
                 ),
             ),
             # Apply tensor decomposition learning rate. Note the negative sign needed
             # for gradient descent.
             optax.masked(
                 optax.scale(-config.lr_init_tensor),
-                mask=render.LearnableParams(
+                mask=render_common.LearnableParams(
                     appearance_mlp_params=False,  # type: ignore
                     appearance_tensor=True,  # type: ignore
-                    density_tensor=True,  # type: ignore
-                    scene_contraction=scene_contraction,
+                    density_tensors=True,  # type: ignore
+                    bounded_scene=bounded_scene,
                 ),
             ),
         )
@@ -279,8 +288,8 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         parameters."""
         with jdc.copy_and_mutate(self, validate=False) as resized:
             # Resample the feature grids, with linear interpolation.
-            resized.learnable_params.density_tensor = (
-                resized.learnable_params.density_tensor.resize(new_grid_dim)
+            resized.learnable_params.density_tensors = (
+                resized.learnable_params.density_tensors[0].resize(new_grid_dim),
             )
             resized.learnable_params.appearance_tensor = (
                 resized.learnable_params.appearance_tensor.resize(new_grid_dim)
@@ -289,18 +298,18 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             # Perform some nasty surgery to resample the momentum parameters as well.
             adam_state = resized.optimizer_state[0]
             assert isinstance(adam_state, optax.ScaleByAdamState)
-            nu: render.LearnableParams = adam_state.nu
-            mu: render.LearnableParams = adam_state.mu
+            nu: render_common.LearnableParams = adam_state.nu
+            mu: render_common.LearnableParams = adam_state.mu
             resized.optimizer_state = (
                 adam_state._replace(  # NamedTuple `_replace()`.
                     nu=jdc.replace(
                         nu,
-                        density_tensor=nu.density_tensor.resize(new_grid_dim),
+                        density_tensors=(nu.density_tensors[0].resize(new_grid_dim),),
                         appearance_tensor=nu.appearance_tensor.resize(new_grid_dim),
                     ),
                     mu=jdc.replace(
                         mu,
-                        density_tensor=mu.density_tensor.resize(new_grid_dim),
+                        density_tensors=(mu.density_tensors[0].resize(new_grid_dim),),
                         appearance_tensor=mu.appearance_tensor.resize(new_grid_dim),
                     ),
                 ),
