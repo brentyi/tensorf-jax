@@ -73,7 +73,11 @@ def render_rays(
 
     # Compute segment probabilities for each ray.
     probs = render_common.SegmentProbabilities.compute(
-        prerectified_sigmas, step_sizes, ts
+        prerectified_sigmas,
+        step_sizes,
+        ts,
+        near=config.near,
+        far=config.far,
     )
     assert (
         probs.get_batch_axes()
@@ -89,7 +93,7 @@ def render_rays(
         #  alas, are quite difficult in JAX. To reduce the number of appearance
         #  computations needed, we instead resort to a weighted sampling approach.
 
-        render_probs, render_indices = probs.resample(
+        render_probs, render_indices = probs.resample_subset(
             num_samples=config.appearance_samples_per_ray,
             prng=render_rgb_prng_key,
         )
@@ -109,8 +113,9 @@ def render_rays(
             render_points,
             rays_wrt_world,
         )
+        rgb_per_point = render_common.direct_rgb_from_mlp(mlp_out)
         return render_common.render_from_mlp_out(
-            mlp_out,
+            rgb_per_point,
             render_probs,
             render_common.RenderMode.RGB,
         )

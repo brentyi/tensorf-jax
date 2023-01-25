@@ -32,8 +32,10 @@ if __name__ == "__main__":
         density_feat_dim=32,
         feature_n_freqs=6,
         viewdir_n_freqs=6,
-        grid_dim_init=128,
-        grid_dim_final=300,
+        density_grid_dim_init=64,
+        density_grid_dim_final=64,
+        app_grid_dim_init=128,
+        app_grid_dim_final=300,
         upsamp_iters=(2_500, 5_000, 10_000),
         bounded_scene=False,
         camera_embeddings=True,
@@ -41,6 +43,8 @@ if __name__ == "__main__":
         render_far=200.0,
         train_ray_sample_multiplier=3.0,
         minibatch_size=2048,
+        density_from_appearance_mlp=True,
+        # density_from_appearance_mlp=False,
     )
 
     # Run training loop! Note that we can set a default value for a function via

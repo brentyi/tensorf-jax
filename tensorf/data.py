@@ -5,14 +5,28 @@ import dataclasses
 import functools
 import json
 import pathlib
-from typing import Any, Dict, Iterable, List, Literal, Protocol, TypeVar
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    Protocol,
+    TypeVar,
+)
 
 import cv2
+import dacite
+import fifteen
+import flax
+import h5py
+import imageio.v3 as iio
 import jax
 import jax_dataclasses as jdc
 import jaxlie
 import numpy as onp
-import PIL.Image
 from jax import numpy as jnp
 from optax._src.alias import transform
 from tqdm.auto import tqdm
@@ -22,11 +36,103 @@ from . import cameras
 
 
 class NerfDataset(Protocol):
-    def get_training_rays(self) -> RenderedRays:
+    dataset_root: pathlib.Path
+
+    def load_all_training_rays(self) -> RenderedRays:
         ...
 
     def get_cameras(self) -> List[cameras.Camera]:
         ...
+
+
+class CachedNerfDataloader:
+    """Dataloader that caches preprocessing and minibatch shuffling to disk. This helps
+    reduce memory usage + startup times.
+
+    Note that we implement the protocol defined by fifteen.util.DataloaderProtocol.
+    """
+
+    def __init__(self, dataset: NerfDataset, minibatch_size: int):
+        cache_path = dataset.dataset_root / "_tensorf_jax_cache.hdf5"
+
+        # Create h5py cache file if one doesn't exist yet.
+        cache_chunk_size = 512
+        assert (
+            minibatch_size % cache_chunk_size == 0
+        ), f"Ideally, minibatch size should be divisible by {cache_chunk_size}"
+        if not cache_path.exists():
+            print(f"{cache_path} does not exist. Creating...")
+
+            # Load all training rays.
+            training_rays = dataset.load_all_training_rays()
+            (num_training_rays,) = training_rays.get_batch_axes()
+
+            # Cull out training rays beyond some threshold.
+            shuffled_indices = onp.random.default_rng(0).permutation(num_training_rays)
+            max_training_rays = 30_000 * 4096
+            if num_training_rays > max_training_rays:
+                print(
+                    f"Culling out rays for cache: {num_training_rays} =>"
+                    f" {max_training_rays}, a"
+                    f" {(1.0 - max_training_rays / num_training_rays) * 100.0:.02f}%"
+                    " decrease"
+                )
+                shuffled_indices = shuffled_indices[:max_training_rays]
+
+            # Shuffle training rays.
+            training_rays = jax.tree_map(lambda x: x[shuffled_indices], training_rays)
+
+            with h5py.File(cache_path, "w", libver="latest") as f:
+                for k, v in flax.traverse_util.flatten_dict(
+                    jdc.asdict(training_rays), sep="."
+                ).items():
+                    assert isinstance(v, onp.ndarray)
+                    print(f"\tWriting {k} with shape {v.shape}")
+                    chunk_shape = (cache_chunk_size,) + v.shape[1:]
+                    group = f.create_dataset(name=k, data=v, chunks=chunk_shape)
+            del training_rays
+
+        self.cache_path = cache_path
+        self.hdf5_file = h5py.File(self.cache_path, "r")
+        self.ray_count = self.hdf5_file["colors"].shape[0]  # type: ignore
+        self.minibatch_size = minibatch_size
+
+    def minibatch_count(self) -> int:
+        return self.ray_count // self.minibatch_size
+
+    def minibatches(
+        self, shuffle_seed: Optional[int]
+    ) -> fifteen.data.SizedIterable[RenderedRays]:
+        class _Inner:
+            def __iter__(_self):
+                for i in range(self.minibatch_count()):
+                    yield self._index(
+                        slice(i * self.minibatch_size, (i + 1) * self.minibatch_size)
+                    )
+
+            def __len__(_self):
+                return self.minibatch_count()
+
+        return _Inner()
+
+    def _index(self, index: slice) -> RenderedRays:
+        contents = {k: v[index] for k, v in self.hdf5_file.items()}
+        return dacite.from_dict(
+            RenderedRays,
+            flax.traverse_util.unflatten_dict(contents, sep="."),
+            config=dacite.Config(check_types=False),
+        )
+        # return RenderedRays(
+        #     colors=contents["colors"],  # type: ignore
+        #     rays_wrt_world=cameras.Rays3D(
+        #         origins=contents["rays_wrt_world.origins"],  # type: ignore
+        #         directions=contents["rays_wrt_world.directions"],  # type: ignore
+        #         camera_indices=contents["rays_wrt_world.camera_indices"],  # type: ignore
+        #     ),
+        # )
+
+    def __len__(self) -> int:
+        return self.ray_count
 
 
 def make_dataset(
@@ -48,7 +154,7 @@ class NerfstudioDataset:
     dataset_root: pathlib.Path
     scene_scale: float
 
-    def get_training_rays(self) -> RenderedRays:
+    def load_all_training_rays(self) -> RenderedRays:
         metadata = self._get_metadata()
 
         camera_model = metadata["camera_model"]
@@ -79,8 +185,10 @@ class NerfstudioDataset:
             h, w = image.shape[:2]
             orig_h, orig_w = h, w
 
-            # Resize image to an arbitrary target dimension.
-            target_pixels = 1200 * 1600
+            # Resize image to some heuristic target dimension.
+            # - We don't want iamges any smaller than 800 x 600.
+            # - We aim for having enough pixels for 30k iterations with batch size 4096.
+            target_pixels = max(600 * 800, 30_000 * 4_096 / len(image_paths))
             scale = 1.0
             if h * w > target_pixels:
                 scale = onp.sqrt(target_pixels / (h * w))
@@ -206,27 +314,30 @@ class NerfstudioDataset:
 class BlenderDataset:
     dataset_root: pathlib.Path
 
-    def get_training_rays(self) -> RenderedRays:
+    def load_all_training_rays(self) -> RenderedRays:
         return rendered_rays_from_views(self._registered_views)
 
     def get_cameras(self) -> List[cameras.Camera]:
-        return [v.camera for v in self._registered_views]
+        return self._cameras
 
     @functools.cached_property
-    def _registered_views(self) -> List[RegisteredRgbaView]:
+    def _cameras(self) -> List[cameras.Camera]:
         metadata = self._get_metadata()
 
-        image_paths: List[pathlib.Path] = []
         transform_matrices: List[onp.ndarray] = []
         for frame in metadata["frames"]:
             assert frame.keys() == {"file_path", "rotation", "transform_matrix"}
 
-            image_paths.append(self.dataset_root / f"{frame['file_path']}.png")
             transform_matrices.append(
                 onp.array(frame["transform_matrix"], dtype=onp.float32)
             )
             assert transform_matrices[-1].shape == (4, 4)  # Should be in SE(3).
         fov_x_radians: float = metadata["camera_angle_x"]
+
+        # Image dimensions. We assume all images are the same.
+        height, width = iio.imread(
+            self.dataset_root / (metadata["frames"][0]["file_path"] + ".png")
+        ).shape[:2]
         del metadata
 
         # Transformation from Blender camera coordinates to OpenCV ones. We like the OpenCV
@@ -236,10 +347,34 @@ class BlenderDataset:
         )
 
         out = []
-        for image, transform_matrix in zip(
+        for transform_matrix in transform_matrices:
+            T_world_blendercam = jaxlie.SE3.from_matrix(transform_matrix)
+            T_camera_world = (T_world_blendercam @ T_blendercam_camera).inverse()
+            out.append(
+                cameras.Camera.from_fov(
+                    T_camera_world=T_camera_world,
+                    image_width=width,
+                    image_height=height,
+                    fov_x_radians=fov_x_radians,
+                )
+            )
+        return out
+
+    @functools.cached_property
+    def _registered_views(self) -> List[RegisteredRgbaView]:
+        metadata = self._get_metadata()
+
+        image_paths: List[pathlib.Path] = []
+        for frame in metadata["frames"]:
+            assert frame.keys() == {"file_path", "rotation", "transform_matrix"}
+            image_paths.append(self.dataset_root / f"{frame['file_path']}.png")
+        del metadata
+
+        out = []
+        for image, camera in zip(
             _threaded_image_fetcher(image_paths),
             tqdm(
-                transform_matrices,
+                self.get_cameras(),
                 desc=f"Loading {self.dataset_root.stem}",
             ),
         ):
@@ -253,17 +388,10 @@ class BlenderDataset:
             image = (image / 255.0).astype(onp.float32)
 
             # Compute extrinsics.
-            T_world_blendercam = jaxlie.SE3.from_matrix(transform_matrix)
-            T_camera_world = (T_world_blendercam @ T_blendercam_camera).inverse()
             out.append(
                 RegisteredRgbaView(
                     image_rgba=image,  # type: ignore
-                    camera=cameras.Camera.from_fov(
-                        T_camera_world=T_camera_world,
-                        image_width=width,
-                        image_height=height,
-                        fov_x_radians=fov_x_radians,
-                    ),
+                    camera=camera,
                 )
             )
         return out
@@ -347,7 +475,7 @@ def _threaded_image_fetcher(paths: Iterable[pathlib.Path]) -> Iterable[onp.ndarr
     Helpful for parallelizing IO."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         for image in executor.map(
-            lambda p: onp.array(PIL.Image.open(p)),
+            iio.imread,
             paths,
             chunksize=4,
         ):

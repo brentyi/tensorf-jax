@@ -10,6 +10,7 @@ import jax
 import jax_dataclasses as jdc
 import optax
 from jax import numpy as jnp
+from jax._src.tree_util import Leaf
 from tqdm.auto import tqdm
 from typing_extensions import Annotated, assert_never
 
@@ -18,6 +19,7 @@ from . import (
     networks,
     render_bounded,
     render_common,
+    render_real,
     tensor_vm,
     train_config,
     utils,
@@ -47,7 +49,8 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     @jdc.jit
     def initialize(
         config: jdc.Static[train_config.TensorfConfig],
-        grid_dim: jdc.Static[int],
+        density_grid_dim: jdc.Static[int],
+        app_grid_dim: jdc.Static[int],
         prng_key: jax.random.KeyArray,
         num_cameras: jdc.Static[int],
     ) -> TrainState:
@@ -62,7 +65,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 viewdir_n_freqs=config.viewdir_n_freqs,
                 # If num_cameras is set, camera embeddings are enabled.
                 num_cameras=num_cameras if config.camera_embeddings else None,
-                output_dim=3,
+                output_dim=4 if config.density_from_appearance_mlp else 3,
             )
             dummy_camera_indices = jnp.zeros((1,), dtype=jnp.uint32)
 
@@ -79,7 +82,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         learnable_params = render_common.LearnableParams(
             appearance_mlp_params=appearance_mlp_params,
             appearance_tensor=tensor_vm.TensorVM.initialize(
-                grid_dim=grid_dim,
+                grid_dim=app_grid_dim,
                 per_axis_channel_dim=config.appearance_feat_dim,
                 init=normal_init,
                 prng_key=prng_keys[1],
@@ -87,7 +90,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             ),
             density_tensors=(
                 tensor_vm.TensorVM.initialize(
-                    grid_dim=grid_dim,
+                    grid_dim=density_grid_dim,
                     per_axis_channel_dim=config.density_feat_dim,
                     init=normal_init,
                     prng_key=prng_keys[2],
@@ -128,29 +131,47 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         ) -> Tuple[jnp.ndarray, fifteen.experiments.TensorboardLogData]:
             # Compute sample counts from grid dimensionality.
             # TODO: move heuristics into config?
-            grid_dim = self.learnable_params.appearance_tensor.grid_dim()
-            assert grid_dim == self.learnable_params.density_tensors[0].grid_dim()
+            density_grid_dim = self.learnable_params.density_tensors[0].grid_dim()
             density_samples_per_ray = int(
-                math.sqrt(3 * grid_dim**2) * self.config.train_ray_sample_multiplier
+                math.sqrt(3 * density_grid_dim**2)
+                * self.config.train_ray_sample_multiplier
             )
-            appearance_samples_per_ray = int(0.15 * density_samples_per_ray)
+            appearance_samples_per_ray = 32  # int(0.15 * density_samples_per_ray)
 
             # Render and compute loss.
-            rendered = render_bounded.render_rays(
-                appearance_mlp=self.appearance_mlp,
-                learnable_params=learnable_params,
-                aabb=self.aabb,
-                rays_wrt_world=minibatch.rays_wrt_world,
-                prng_key=render_prng_key,
-                config=render_common.RenderConfig(
-                    near=self.config.render_near,
-                    far=self.config.render_far,
-                    mode=render_common.RenderMode.RGB,
-                    density_samples_per_ray=(density_samples_per_ray,),
-                    appearance_samples_per_ray=appearance_samples_per_ray,
-                ),
-                dtype=compute_dtype,
-            )
+            if self.config.bounded_scene:
+                rendered = render_bounded.render_rays(
+                    appearance_mlp=self.appearance_mlp,
+                    learnable_params=learnable_params,
+                    aabb=self.aabb,
+                    rays_wrt_world=minibatch.rays_wrt_world,
+                    prng_key=render_prng_key,
+                    config=render_common.RenderConfig(
+                        near=self.config.render_near,
+                        far=self.config.render_far,
+                        mode=render_common.RenderMode.RGB,
+                        density_samples_per_ray=(density_samples_per_ray,),
+                        appearance_samples_per_ray=appearance_samples_per_ray,
+                    ),
+                    dtype=compute_dtype,
+                )
+                interlevel_loss = 0.0
+            else:
+                rendered, interlevel_loss = render_real.render_rays(
+                    appearance_mlp=self.appearance_mlp,
+                    learnable_params=learnable_params,
+                    aabb=self.aabb,
+                    rays_wrt_world=minibatch.rays_wrt_world,
+                    prng_key=render_prng_key,
+                    config=render_common.RenderConfig(
+                        near=self.config.render_near,
+                        far=self.config.render_far,
+                        mode=render_common.RenderMode.RGB,
+                        density_samples_per_ray=(density_samples_per_ray,),
+                        appearance_samples_per_ray=appearance_samples_per_ray,
+                    ),
+                    dtype=compute_dtype,
+                )
             assert (
                 rendered.shape
                 == minibatch.colors.shape
@@ -161,12 +182,13 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             assert jnp.issubdtype(label_colors.dtype, jnp.float32)
 
             mse = jnp.mean((rendered - label_colors) ** 2)
-            loss = mse  # TODO: add regularization terms.
+            loss = mse + interlevel_loss  # TODO: add regularization terms.
 
             log_data = fifteen.experiments.TensorboardLogData(
                 scalars={
                     "mse": mse,
                     "psnr": utils.psnr_from_mse(mse),
+                    "interlevel_loss": interlevel_loss,
                 }
             )
             return loss * self.config.loss_scale, log_data
@@ -283,16 +305,23 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
             ),
         )
 
-    def resize_grid(self, new_grid_dim: int) -> TrainState:
+    def resize_grid(
+        self,
+        new_density_grid_dim: int,
+        new_app_grid_dim: int,
+    ) -> TrainState:
         """Resize the grid underlying a training state by linearly interpolating grid
         parameters."""
         with jdc.copy_and_mutate(self, validate=False) as resized:
+            num_density_tensors = len(resized.learnable_params.density_tensors)
+
             # Resample the feature grids, with linear interpolation.
-            resized.learnable_params.density_tensors = (
-                resized.learnable_params.density_tensors[0].resize(new_grid_dim),
+            resized.learnable_params.density_tensors = tuple(
+                resized.learnable_params.density_tensors[i].resize(new_density_grid_dim)
+                for i in range(num_density_tensors)
             )
             resized.learnable_params.appearance_tensor = (
-                resized.learnable_params.appearance_tensor.resize(new_grid_dim)
+                resized.learnable_params.appearance_tensor.resize(new_app_grid_dim)
             )
 
             # Perform some nasty surgery to resample the momentum parameters as well.
@@ -304,13 +333,19 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 adam_state._replace(  # NamedTuple `_replace()`.
                     nu=jdc.replace(
                         nu,
-                        density_tensors=(nu.density_tensors[0].resize(new_grid_dim),),
-                        appearance_tensor=nu.appearance_tensor.resize(new_grid_dim),
+                        density_tensors=tuple(
+                            nu.density_tensors[i].resize(new_density_grid_dim)
+                            for i in range(num_density_tensors)
+                        ),
+                        appearance_tensor=nu.appearance_tensor.resize(new_app_grid_dim),
                     ),
                     mu=jdc.replace(
                         mu,
-                        density_tensors=(mu.density_tensors[0].resize(new_grid_dim),),
-                        appearance_tensor=mu.appearance_tensor.resize(new_grid_dim),
+                        density_tensors=tuple(
+                            mu.density_tensors[i].resize(new_density_grid_dim)
+                            for i in range(num_density_tensors)
+                        ),
+                        appearance_tensor=mu.appearance_tensor.resize(new_app_grid_dim),
                     ),
                 ),
             ) + resized.optimizer_state[1:]
@@ -349,16 +384,16 @@ def run_training_loop(
     train_state: TrainState
     train_state = TrainState.initialize(
         config,
-        grid_dim=config.grid_dim_init,
+        density_grid_dim=config.density_grid_dim_init,
+        app_grid_dim=config.app_grid_dim_init,
         prng_key=jax.random.PRNGKey(94709),
         num_cameras=num_cameras,
     )
     if restore_checkpoint:
         train_state = experiment.restore_checkpoint(train_state)
 
-    dataloader = fifteen.data.InMemoryDataLoader(
-        dataset=dataset.get_training_rays(),
-        minibatch_size=config.minibatch_size,
+    dataloader = data.CachedNerfDataloader(
+        dataset=dataset, minibatch_size=config.minibatch_size
     )
     minibatches = fifteen.data.cycled_minibatches(dataloader, shuffle_seed=0)
     minibatches = iter(minibatches)
@@ -401,9 +436,14 @@ def run_training_loop(
         if train_step in config.upsamp_iters:
             upsamp_index = config.upsamp_iters.index(train_step)
             train_state = train_state.resize_grid(
-                new_grid_dim=int(
-                    config.grid_dim_init
-                    + (config.grid_dim_final - config.grid_dim_init)
+                new_density_grid_dim=int(
+                    config.density_grid_dim_init
+                    + (config.density_grid_dim_final - config.density_grid_dim_init)
                     * ((upsamp_index + 1) / len(config.upsamp_iters))
-                )
+                ),
+                new_app_grid_dim=int(
+                    config.app_grid_dim_init
+                    + (config.app_grid_dim_final - config.app_grid_dim_init)
+                    * ((upsamp_index + 1) / len(config.upsamp_iters))
+                ),
             )

@@ -5,7 +5,7 @@ import jax_dataclasses as jdc
 import numpy as onp
 from jax import numpy as jnp
 
-from . import cameras, networks, render_common, tensor_vm, utils
+from . import cameras, interlevel, networks, render_common, tensor_vm, utils
 
 
 def render_rays(
@@ -18,10 +18,11 @@ def render_rays(
     *,
     proposal_anneal_factor: float = 1.0,
     dtype: jdc.Static[Any] = jnp.float32,
-) -> jnp.ndarray:
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Render a set of rays.
 
-    Output should have shape `(ray_count, 3)`."""
+    Output should have shape `(ray_count, 3)` and `()`, where the latter is an
+    interlevel/proposal loss."""
 
     num_density_tensors = len(learnable_params.density_tensors)
     assert len(config.density_samples_per_ray) == num_density_tensors
@@ -33,7 +34,7 @@ def render_rays(
     )
     (ray_count,) = rays_wrt_world.get_batch_axes()
 
-    sample_prng_keys = jax.random.split(prng_key, num=len(num_density_tensors + 1))
+    sample_prng_keys = jax.random.split(prng_key, num=num_density_tensors + 1)
 
     # Sample initial points in world space.
     ts, step_sizes = sample_initial_points_from_rays(
@@ -44,50 +45,78 @@ def render_rays(
         sample_prng_key=sample_prng_keys[0],
     )
     render_points = rays_wrt_world.points_from_ts(ts)
-    assert render_points.shape == (ray_count, config.density_samples_per_ray[0], 3)
+    render_points = jnp.moveaxis(render_points, -1, 0)
+    assert render_points.shape == (3, ray_count, config.density_samples_per_ray[0])
 
-    # Run proposal networks.
-    # [ ] fix resampling.
-    # [ ] Supervise proposal networks.
-    # [ ] distortion loss?
-    # that's it!
+    def compute_sdist(ts):
+        num_rays, _ = ts.shape
+        midpoints = (ts[..., 1:] + ts[..., :-1]) / 2.0
+        boundaries = jnp.concatenate(
+            [
+                jnp.full((num_rays, 1), config.near),
+                midpoints,
+                jnp.full((num_rays, 1), config.far),
+            ],
+            axis=-1,
+        )
+        return (boundaries - config.near) / config.far
+
     probs = None
+    ray_history = []
     for i in range(num_density_tensors):
         density_feat = interpolate_contracted(
             learnable_params.density_tensors[i], render_points
         )
         prerectified_sigmas = jnp.sum(density_feat, axis=0)
         probs = render_common.SegmentProbabilities.compute(
-            prerectified_sigmas, step_sizes=step_sizes, ts=ts
+            prerectified_sigmas,
+            step_sizes=step_sizes,
+            ts=ts,
+            near=config.near,
+            far=config.far,
+        )
+        ray_history.append(
+            {"sdist": compute_sdist(probs.ts), "weights": probs.p_terminates}
         )
         del prerectified_sigmas
         del density_feat
 
-        probs, indices = probs.stratified_resample(
+        ts = probs.sample_stratified_ts(
+            prng=sample_prng_keys[i + 1],
             num_samples=(
                 config.density_samples_per_ray[i + 1]
                 if i < num_density_tensors - 1
                 else config.appearance_samples_per_ray
             ),
-            prng=sample_prng_keys[i + 1],
             anneal_factor=proposal_anneal_factor,
         )
-        render_points = jnp.take_along_axis(
-            arr=render_points, indices=indices[None, :, :], axis=-1
-        )
+        render_points = rays_wrt_world.points_from_ts(ts)
+        render_points = jnp.moveaxis(render_points, -1, 0)
     assert probs is not None
 
-    appearance_mlp_out = render_common.get_appearance_mlp_out(
+    mlp_out = render_common.get_appearance_mlp_out(
         appearance_mlp,
         learnable_params,
         render_points,
         rays_wrt_world,
     )
-    return render_common.render_from_mlp_out(
-        appearance_mlp_out,
+    if mlp_out.shape[-1] == 3:
+        # TODO: probs is broken in this case.
+        rgb_per_point = render_common.direct_rgb_from_mlp(mlp_out)
+    else:
+        rgb_per_point, probs = render_common.rgb_and_density_from_mlp(
+            mlp_out, ts, config
+        )
+    rendered = render_common.render_from_mlp_out(
+        rgb_per_point,
         probs,
         config.mode,
     )
+    ray_history.append(
+        {"sdist": compute_sdist(probs.ts), "weights": probs.p_terminates}
+    )
+
+    return rendered, interlevel.interlevel_loss(ray_history)
 
 
 def interpolate_contracted(
@@ -96,19 +125,18 @@ def interpolate_contracted(
 ) -> jnp.ndarray:
     """Interpolate a feature vector from a VM decomposed tensor, with scene
     contraction."""
-    assert points.shape[-1] == 3
+    assert points.shape[0] == 3
 
     # Contract points to cube.
-    norm = jnp.linalg.norm(points, ord=jnp.inf, axis=-1, keepdims=True)
+    norm = jnp.linalg.norm(points, ord=jnp.inf, axis=0, keepdims=True)
     contracted_points = jnp.where(
         norm <= 1.0, points, (2.0 - 1.0 / norm) * points / norm
     )
     assert isinstance(contracted_points, jnp.ndarray)
-    contracted_points = jnp.moveaxis(contracted_points, -1, 0)
     assert contracted_points.shape[0] == 3
 
     out = tensor.interpolate(contracted_points)
-    assert out.shape == (tensor.channel_dim(), *contracted_points.shape[:-1])
+    assert out.shape == (tensor.channel_dim(), *points.shape[1:])
     return out
 
 

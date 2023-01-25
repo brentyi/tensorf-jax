@@ -31,8 +31,10 @@ if __name__ == "__main__":
         density_feat_dim=16,
         feature_n_freqs=2,
         viewdir_n_freqs=2,
-        grid_dim_init=128,
-        grid_dim_final=300,
+        density_grid_dim_init=128,
+        density_grid_dim_final=300,
+        app_grid_dim_init=128,
+        app_grid_dim_final=300,
         upsamp_iters=(2000, 3000, 4000, 5500, 7000),
     )
 

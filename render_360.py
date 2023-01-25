@@ -67,7 +67,7 @@ def main(args: Args) -> None:
     # Load the training state from a checkpoint.
     train_state = tensorf.training.TrainState.initialize(
         config=config,
-        grid_dim=config.grid_dim_final,
+        density_grid_dim=config.grid_dim_final,
         prng_key=jax.random.PRNGKey(0),
         num_cameras=experiment.read_metadata("num_cameras", int),
     )

@@ -51,8 +51,10 @@ class TensorfConfig:
 
     # Grid parameters; we define the initial and final grid dimensions as well as when
     # to upsample or update the alpha mask.
-    grid_dim_init: int = 128  # cbrt(N_voxel_init)
-    grid_dim_final: int = 300  # cbrt(N_voxel_final)
+    density_grid_dim_init: int = 64  # cbrt(N_voxel_init)
+    density_grid_dim_final: int = 64  # cbrt(N_voxel_final)
+    app_grid_dim_init: int = 128  # cbrt(N_voxel_init)
+    app_grid_dim_final: int = 300  # cbrt(N_voxel_final)
     upsamp_iters: Tuple[int, ...] = (2000, 3000, 4000, 5500, 7000)
 
     # TODO: unimplemented.
@@ -94,9 +96,4 @@ class TensorfConfig:
     train_ray_sample_multiplier: float = 1.0
 
     # Proposal networks.
-    density_from_appearance_mlp = True
-    sampling_strategy: Literal["proposal_tensors"] = ""
-
-
-    #
-    resample_anneal: bool
+    density_from_appearance_mlp: bool = False

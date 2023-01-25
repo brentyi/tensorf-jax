@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Literal, NewType, Tuple, cast
+from typing import Literal, NewType, Optional, Tuple, cast
 
 import flax
 import jax
 import jax_dataclasses as jdc
+import numpy as onp
 from jax import numpy as jnp
 from typing_extensions import Annotated, assert_never
 
@@ -58,6 +59,8 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
     For a ray to terminate in a segment, it must first pass through (and 'exit') all
     previous segments."""
 
+    near: float
+    far: float
     ts: Annotated[jnp.ndarray, (), jnp.floating]
     step_sizes: Annotated[jnp.ndarray, (), jnp.floating]
 
@@ -66,10 +69,52 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         assert len(self.get_batch_axes()) == 2
         return self.get_batch_axes()[0]
 
-    # def stratified_resample():
-    #     pass
+    def sample_stratified_ts(
+        self,
+        prng: jax.random.KeyArray,
+        num_samples: int,
+        anneal_factor: float,
+    ) -> jnp.ndarray:
+        *batch_dims, old_num_samples = self.p_terminates.shape
+        batch_dims = tuple(batch_dims)
 
-    def resample(
+        # Accumulate weights, and scale from 0 to 1.
+        accumulated_weights = jnp.cumsum(self.p_terminates, axis=-1)
+        accumulated_weights = jnp.concatenate(
+            [jnp.zeros(batch_dims + (1,)), accumulated_weights],
+            axis=-1,
+        )
+        accumulated_weights = accumulated_weights / (
+            accumulated_weights[..., -1:] + 1e-4
+        )
+        assert accumulated_weights.shape == batch_dims + (old_num_samples + 1,)
+
+        bin_boundaries = jnp.concatenate(
+            [
+                self.step_sizes + self.near,
+                jnp.full(shape=(*batch_dims, 1), fill_value=self.far),
+            ],
+            axis=-1,
+        )
+
+        batch_dim_flattened = int(onp.prod(batch_dims))
+
+        x = _sample_quasi_uniform_ordered(
+            prng,
+            min_bound=0.0,
+            max_bound=1.0,
+            bins=num_samples,
+            batch_dims=(batch_dim_flattened,),
+        )
+        samples = jax.vmap(jnp.interp)(
+            x=x,
+            xp=accumulated_weights.reshape((batch_dim_flattened, -1)),
+            fp=bin_boundaries.reshape((batch_dim_flattened, -1)),
+        ).reshape(batch_dims + (num_samples,))
+
+        return samples
+
+    def resample_subset(
         self,
         num_samples: int,
         prng: jax.random.KeyArray,
@@ -116,7 +161,18 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
             self.p_terminates, sample_indices, axis=-1
         )
         sub_ts = jnp.take_along_axis(self.ts, sample_indices, axis=-1)
-        sub_step_sizes = jnp.take_along_axis(self.step_sizes, sample_indices, axis=-1)
+
+        midpoints = (sub_ts[..., 1:] + sub_ts[..., :-1]) / 2.0
+        boundaries = jnp.concatenate(
+            [
+                jnp.full((num_rays, 1), self.near),
+                midpoints,
+                jnp.full((num_rays, 1), self.far),
+            ],
+            axis=-1,
+        )
+        sub_step_sizes = boundaries[..., 1:] - boundaries[..., :-1]
+        del midpoints, boundaries
 
         # Coefficients for unbiasing the expected RGB values using the sampling
         # probabilities. This is helpful because RGB values for points that are not chosen
@@ -152,6 +208,8 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         out = SegmentProbabilities(
             p_exits=sub_p_exits,
             p_terminates=sub_p_terminates,
+            near=self.near,
+            far=self.far,
             ts=sub_ts,
             step_sizes=sub_step_sizes,
         )
@@ -196,7 +254,11 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
 
     @staticmethod
     def compute(
-        prerectified_sigmas: jnp.ndarray, step_sizes: jnp.ndarray, ts: jnp.ndarray
+        prerectified_sigmas: jnp.ndarray,
+        step_sizes: jnp.ndarray,
+        ts: jnp.ndarray,
+        near: float,
+        far: float,
     ) -> SegmentProbabilities:
         r"""Compute some probabilities needed for rendering rays. Expects sigmas of shape
         (*, sample_count) and a per-ray step size of shape (*,).
@@ -244,12 +306,15 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         return SegmentProbabilities(
             p_exits=p_exits,
             p_terminates=p_terminates,
+            near=near,
+            far=far,
             ts=ts,
             step_sizes=step_sizes,
         )
 
 
 MlpOutArray = NewType("MlpOutArray", jnp.ndarray)
+RgbPerPointArray = NewType("RgbPerPointArray", jnp.ndarray)
 
 
 def get_appearance_mlp_out(
@@ -298,26 +363,73 @@ def get_appearance_mlp_out(
     return MlpOutArray(mlp_out)
 
 
-def render_from_mlp_out(
+def direct_rgb_from_mlp(mlp_out: MlpOutArray) -> RgbPerPointArray:
+    """No-op."""
+    assert mlp_out.shape[-1] == 3
+    return RgbPerPointArray(mlp_out)
+
+
+def rgb_and_density_from_mlp(
     mlp_out: MlpOutArray,
+    ts: jnp.ndarray,
+    config: RenderConfig,
+) -> Tuple[RgbPerPointArray, SegmentProbabilities]:
+    assert mlp_out.shape[-1] == 4
+
+    # Extract RGB values.
+    rgb_per_point = RgbPerPointArray(mlp_out[..., :3])
+
+    # ompute step sizes from ts, nears, fars.
+    num_rays, _num_samples = ts.shape
+    midpoints = (ts[..., 1:] + ts[..., :-1]) / 2.0
+    boundaries = jnp.concatenate(
+        [
+            jnp.full((num_rays, 1), config.near),
+            midpoints,
+            jnp.full((num_rays, 1), config.far),
+        ],
+        axis=-1,
+    )
+    step_sizes = boundaries[..., 1:] - boundaries[..., :-1]
+
+    probs = SegmentProbabilities.compute(
+        prerectified_sigmas=mlp_out[..., -1],
+        step_sizes=step_sizes,
+        ts=ts,
+        near=config.near,
+        far=config.far,
+    )
+    return rgb_per_point, probs
+
+
+def render_from_mlp_out(
+    rgb_per_point: RgbPerPointArray,
     probs: SegmentProbabilities,
     mode: RenderMode,
 ) -> jnp.ndarray:
+    """Returns rendered colors, and updated probabilities if original ones were
+    overwritten via a density a channel from the MLP."""
 
-    (ray_count, samples_per_ray, out_dim) = mlp_out.shape
-    dtype = mlp_out.dtype
+    (ray_count, samples_per_ray, out_dim) = rgb_per_point.shape
+    dtype = rgb_per_point.dtype
 
-    if mlp_out.shape[-1] == 3:
-        rgb_per_point = jax.nn.sigmoid(mlp_out)
-    elif mlp_out.shape[-1] == 4:
-        rgb_per_point = jax.nn.sigmoid(mlp_out[..., :3])
-        probs = SegmentProbabilities.compute(
-            prerectified_sigmas=mlp_out[..., 3],
-            step_sizes=probs.step_sizes,
-            ts=probs.ts,
-        )
-    else:
-        assert False, f"Unsupported shape {mlp_out.shape}"
+    overridden_probs = False
+    assert rgb_per_point.shape[-1] == 3
+    rgb_per_point = jax.nn.sigmoid(rgb_per_point)
+    # if mlp_out.shape[-1] == 3:
+    #     rgb_per_point = jax.nn.sigmoid(mlp_out)
+    # elif mlp_out.shape[-1] == 4:
+    #     rgb_per_point = jax.nn.sigmoid(mlp_out[..., :3])
+    #     probs = SegmentProbabilities.compute(
+    #         prerectified_sigmas=mlp_out[..., 3],
+    #         step_sizes=probs.step_sizes,
+    #         ts=probs.ts,
+    #         near=probs.near,
+    #         far=probs.far,
+    #     )
+    #     overridden_probs = True
+    # else:
+    #     assert False, f"Unsupported shape {mlp_out.shape}"
 
     expected_rgb = jnp.sum(rgb_per_point * probs.p_terminates[:, :, None], axis=-2)
     assert expected_rgb.shape == (ray_count, 3)
@@ -328,4 +440,32 @@ def render_from_mlp_out(
         expected_rgb + probs.p_exits[:, -1:] * background_color
     )
     assert expected_rgb_with_background.shape == (ray_count, 3)
+
     return expected_rgb_with_background
+
+
+def _sample_quasi_uniform_ordered(
+    prng: jax.random.KeyArray,
+    min_bound: float,
+    max_bound: float,
+    bins: int,
+    batch_dims: Tuple[int, ...],
+) -> jnp.ndarray:
+    """Quasi-uniform sampling. Separates the sampling range into a specified number of
+    bins, and selects one sample from each bin.
+    Output is in ascending order."""
+    sampling_bin_size = (max_bound - min_bound) / bins
+    sampling_bin_starts = onp.arange(0, bins, dtype=onp.float32) * sampling_bin_size
+
+    # Add some batch axes; these two lines are totally unnecessary.
+    for i in range(len(batch_dims)):
+        sampling_bin_starts = sampling_bin_starts[None, ...]
+
+    samples = sampling_bin_starts + jax.random.uniform(
+        key=prng,
+        shape=batch_dims + (bins,),
+        minval=0.0,
+        maxval=sampling_bin_size,
+    )
+    assert samples.shape == batch_dims + (bins,)
+    return samples
