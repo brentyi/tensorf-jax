@@ -136,7 +136,13 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 math.sqrt(3 * density_grid_dim**2)
                 * self.config.train_ray_sample_multiplier
             )
-            appearance_samples_per_ray = 32  # int(0.15 * density_samples_per_ray)
+
+            app_grid_dim = self.learnable_params.appearance_tensor.grid_dim()
+            appearance_samples_per_ray = 64  # int(
+            #      math.sqrt(3 * app_grid_dim**2)
+            #      * self.config.train_ray_sample_multiplier
+            #      * 0.2
+            #  )
 
             # Render and compute loss.
             if self.config.bounded_scene:
@@ -170,6 +176,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                         density_samples_per_ray=(density_samples_per_ray,),
                         appearance_samples_per_ray=appearance_samples_per_ray,
                     ),
+                    proposal_anneal_factor=1.0,
                     dtype=compute_dtype,
                 )
             assert (

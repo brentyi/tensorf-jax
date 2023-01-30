@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Literal, NewType, Optional, Tuple, cast
+from typing import Callable, Literal, NewType, Optional, Tuple, cast
 
 import flax
 import jax
@@ -59,60 +59,12 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
     For a ray to terminate in a segment, it must first pass through (and 'exit') all
     previous segments."""
 
-    near: float
-    far: float
-    ts: Annotated[jnp.ndarray, (), jnp.floating]
-    step_sizes: Annotated[jnp.ndarray, (), jnp.floating]
+    bins: Bins
 
     def get_num_rays(self) -> int:
         # The batch axes should be (num_rays, num_samples).
         assert len(self.get_batch_axes()) == 2
         return self.get_batch_axes()[0]
-
-    def sample_stratified_ts(
-        self,
-        prng: jax.random.KeyArray,
-        num_samples: int,
-        anneal_factor: float,
-    ) -> jnp.ndarray:
-        *batch_dims, old_num_samples = self.p_terminates.shape
-        batch_dims = tuple(batch_dims)
-
-        # Accumulate weights, and scale from 0 to 1.
-        accumulated_weights = jnp.cumsum(self.p_terminates, axis=-1)
-        accumulated_weights = jnp.concatenate(
-            [jnp.zeros(batch_dims + (1,)), accumulated_weights],
-            axis=-1,
-        )
-        accumulated_weights = accumulated_weights / (
-            accumulated_weights[..., -1:] + 1e-4
-        )
-        assert accumulated_weights.shape == batch_dims + (old_num_samples + 1,)
-
-        bin_boundaries = jnp.concatenate(
-            [
-                self.step_sizes + self.near,
-                jnp.full(shape=(*batch_dims, 1), fill_value=self.far),
-            ],
-            axis=-1,
-        )
-
-        batch_dim_flattened = int(onp.prod(batch_dims))
-
-        x = _sample_quasi_uniform_ordered(
-            prng,
-            min_bound=0.0,
-            max_bound=1.0,
-            bins=num_samples,
-            batch_dims=(batch_dim_flattened,),
-        )
-        samples = jax.vmap(jnp.interp)(
-            x=x,
-            xp=accumulated_weights.reshape((batch_dim_flattened, -1)),
-            fp=bin_boundaries.reshape((batch_dim_flattened, -1)),
-        ).reshape(batch_dims + (num_samples,))
-
-        return samples
 
     def resample_subset(
         self,
@@ -120,7 +72,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         prng: jax.random.KeyArray,
         anneal_factor: float = 1.0,
     ) -> Tuple[SegmentProbabilities, jnp.ndarray]:
-        """Hierarchical resampling, with anneal factor as per mipNeRF-360.
+        """Hierarchical resampling.
 
         Returns resampled probabilities and a selected index array.
 
@@ -160,19 +112,16 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         sub_p_terminates = jnp.take_along_axis(
             self.p_terminates, sample_indices, axis=-1
         )
-        sub_ts = jnp.take_along_axis(self.ts, sample_indices, axis=-1)
-
-        midpoints = (sub_ts[..., 1:] + sub_ts[..., :-1]) / 2.0
-        boundaries = jnp.concatenate(
-            [
-                jnp.full((num_rays, 1), self.near),
-                midpoints,
-                jnp.full((num_rays, 1), self.far),
-            ],
-            axis=-1,
+        sub_bins = Bins(
+            ts=jnp.take_along_axis(self.bins.ts, sample_indices, axis=-1),
+            step_sizes=jnp.take_along_axis(
+                self.bins.step_sizes, sample_indices, axis=-1
+            ),
+            starts=jnp.take_along_axis(self.bins.starts, sample_indices, axis=-1),
+            ends=jnp.take_along_axis(self.bins.ends, sample_indices, axis=-1),
+            contiguous=False,
         )
-        sub_step_sizes = boundaries[..., 1:] - boundaries[..., :-1]
-        del midpoints, boundaries
+        assert sub_bins.ts.shape == sub_p_exits.shape
 
         # Coefficients for unbiasing the expected RGB values using the sampling
         # probabilities. This is helpful because RGB values for points that are not chosen
@@ -208,10 +157,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         out = SegmentProbabilities(
             p_exits=sub_p_exits,
             p_terminates=sub_p_terminates,
-            near=self.near,
-            far=self.far,
-            ts=sub_ts,
-            step_sizes=sub_step_sizes,
+            bins=sub_bins,
         )
         assert out.get_batch_axes() == (num_rays, new_sample_count)
         return out
@@ -222,19 +168,22 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         """Render distances. Useful for depth maps, etc."""
         if mode is RenderMode.DIST_MEAN:
             # Compute distance via expected value.
-            sample_distances = jnp.concatenate([self.ts, self.ts[:, -1:]], axis=-1)
+            sample_distances = jnp.concatenate(
+                [self.bins.ts, self.bins.ts[:, -1:]], axis=-1
+            )
             p_terminates_padded = jnp.concatenate(
                 [self.p_terminates, self.p_exits[:, -1:]], axis=-1
             )
             assert sample_distances.shape == p_terminates_padded.shape
             return jnp.sum(p_terminates_padded * sample_distances, axis=-1)
         elif mode is RenderMode.DIST_MEDIAN:
-            dtype = self.ts.dtype
+            dtype = self.bins.ts.dtype
             (*batch_axes, _num_samples) = self.get_batch_axes()
 
             # Compute distance via median.
             sample_distances = jnp.concatenate(
-                [self.ts, jnp.full((*batch_axes, 1), jnp.inf, dtype=dtype)], axis=-1
+                [self.bins.ts, jnp.full((*batch_axes, 1), jnp.inf, dtype=dtype)],
+                axis=-1,
             )
             p_not_alive_padded = jnp.concatenate(
                 [1.0 - self.p_exits, jnp.ones((*batch_axes, 1), dtype=dtype)], axis=-1
@@ -255,10 +204,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
     @staticmethod
     def compute(
         prerectified_sigmas: jnp.ndarray,
-        step_sizes: jnp.ndarray,
-        ts: jnp.ndarray,
-        near: float,
-        far: float,
+        bins: Bins,
     ) -> SegmentProbabilities:
         r"""Compute some probabilities needed for rendering rays. Expects sigmas of shape
         (*, sample_count) and a per-ray step size of shape (*,).
@@ -274,14 +220,19 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         where l_i is the length of segment i.
         """
 
+        # Initial training tends to be faster with a truncated exponential, but
+        # converged PSNRs are higher with a softplus.
+        #
+        # The trunc_exp may still be nice for half-precision training.
         sigmas = jax.nn.softplus(prerectified_sigmas + 10.0)
+        # sigmas = trunc_exp(prerectified_sigmas)
 
         # Support arbitrary leading batch axes.
         (*batch_axes, sample_count) = sigmas.shape
-        assert step_sizes.shape == (*batch_axes, sample_count)
+        assert bins.step_sizes.shape == (*batch_axes, sample_count)
 
         # Equation 1.
-        neg_scaled_sigmas = -sigmas * step_sizes
+        neg_scaled_sigmas = -sigmas * bins.step_sizes
         p_exits = jnp.exp(jnp.cumsum(neg_scaled_sigmas, axis=-1))
         assert p_exits.shape == (*batch_axes, sample_count)
 
@@ -306,10 +257,7 @@ class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
         return SegmentProbabilities(
             p_exits=p_exits,
             p_terminates=p_terminates,
-            near=near,
-            far=far,
-            ts=ts,
-            step_sizes=step_sizes,
+            bins=bins,
         )
 
 
@@ -322,12 +270,13 @@ def get_appearance_mlp_out(
     learnable_params: LearnableParams,
     points: jnp.ndarray,
     rays_wrt_world: cameras.Rays3D,
+    interpolate_func: Callable[[tensor_vm.TensorVM, jnp.ndarray], jnp.ndarray],
 ) -> MlpOutArray:
     assert points.shape[0] == 3
     _, ray_count, samples_per_ray = points.shape
 
     appearance_tensor = learnable_params.appearance_tensor
-    appearance_feat = appearance_tensor.interpolate(points)
+    appearance_feat = interpolate_func(appearance_tensor, points)
     assert appearance_feat.shape == (
         appearance_tensor.channel_dim(),
         ray_count,
@@ -369,43 +318,28 @@ def direct_rgb_from_mlp(mlp_out: MlpOutArray) -> RgbPerPointArray:
     return RgbPerPointArray(mlp_out)
 
 
-def rgb_and_density_from_mlp(
-    mlp_out: MlpOutArray,
-    ts: jnp.ndarray,
-    config: RenderConfig,
-) -> Tuple[RgbPerPointArray, SegmentProbabilities]:
-    assert mlp_out.shape[-1] == 4
-
-    # Extract RGB values.
-    rgb_per_point = RgbPerPointArray(mlp_out[..., :3])
-
-    # ompute step sizes from ts, nears, fars.
-    num_rays, _num_samples = ts.shape
-    midpoints = (ts[..., 1:] + ts[..., :-1]) / 2.0
-    boundaries = jnp.concatenate(
-        [
-            jnp.full((num_rays, 1), config.near),
-            midpoints,
-            jnp.full((num_rays, 1), config.far),
-        ],
-        axis=-1,
-    )
-    step_sizes = boundaries[..., 1:] - boundaries[..., :-1]
-
-    probs = SegmentProbabilities.compute(
-        prerectified_sigmas=mlp_out[..., -1],
-        step_sizes=step_sizes,
-        ts=ts,
-        near=config.near,
-        far=config.far,
-    )
-    return rgb_per_point, probs
+#  def rgb_and_density_from_mlp(
+#      mlp_out: MlpOutArray,
+#      bins: Bins,
+#  ) -> Tuple[RgbPerPointArray, SegmentProbabilities]:
+#      assert mlp_out.shape[-1] == 4
+#
+#      # Extract RGB values.
+#      rgb_per_point = RgbPerPointArray(mlp_out[..., :3])
+#
+#      probs = SegmentProbabilities.compute(
+#          prerectified_sigmas=mlp_out[..., -1] + 10.0,
+#          step_sizes=bins.step_sizes,
+#          ts=bins.ts,
+#      )
+#      return rgb_per_point, probs
 
 
 def render_from_mlp_out(
     rgb_per_point: RgbPerPointArray,
     probs: SegmentProbabilities,
     mode: RenderMode,
+    background_mode: Literal["white", "last_sample"] = "white",
 ) -> jnp.ndarray:
     """Returns rendered colors, and updated probabilities if original ones were
     overwritten via a density a channel from the MLP."""
@@ -435,13 +369,90 @@ def render_from_mlp_out(
     assert expected_rgb.shape == (ray_count, 3)
 
     # Add white background.
-    background_color = jnp.ones(3, dtype=dtype)
+    if background_mode == "white":
+        background_color = jnp.ones(3, dtype=dtype)
+    elif background_mode == "last_sample":
+        background_color = rgb_per_point[..., -1, :]
+    else:
+        assert_never(background_mode)
+
     expected_rgb_with_background = (
         expected_rgb + probs.p_exits[:, -1:] * background_color
     )
     assert expected_rgb_with_background.shape == (ray_count, 3)
 
     return expected_rgb_with_background
+
+
+@jdc.pytree_dataclass
+class Bins:
+    ts: jnp.ndarray
+    step_sizes: jnp.ndarray
+
+    starts: jnp.ndarray
+    ends: jnp.ndarray
+
+    contiguous: jdc.Static[bool]
+    """True if there are no gaps between bins."""
+
+    @staticmethod
+    def from_boundaries(boundaries: jnp.ndarray) -> Bins:
+        starts = boundaries[..., :-1]
+        ends = boundaries[..., 1:]
+        step_sizes = ends - starts
+        ts = starts + step_sizes / 2.0
+
+        return Bins(
+            ts=ts,
+            step_sizes=step_sizes,
+            starts=starts,
+            ends=ends,
+            contiguous=True,
+        )
+
+    def weighted_sample_stratified(
+        self,
+        weights: jnp.ndarray,
+        prng: jax.random.KeyArray,
+        num_samples: int,
+        anneal_factor: float,
+    ) -> jnp.ndarray:
+        *batch_dims, old_num_samples = weights.shape
+        batch_dims = tuple(batch_dims)
+
+        assert self.contiguous, "Currently only contiguous bins are supported."
+        boundaries = jnp.concatenate(
+            [self.starts, self.ends[..., -1:]],
+            axis=-1,
+        )
+
+        # Accumulate weights, and scale from 0 to 1.
+        accumulated_weights = jnp.cumsum(weights, axis=-1)
+        accumulated_weights = jnp.concatenate(
+            [jnp.zeros(batch_dims + (1,)), accumulated_weights],
+            axis=-1,
+        )
+        accumulated_weights = accumulated_weights / (
+            accumulated_weights[..., -1:] + 1e-4
+        )
+        assert accumulated_weights.shape == batch_dims + (old_num_samples + 1,)
+
+        batch_dim_flattened = int(onp.prod(batch_dims))
+
+        x = _sample_quasi_uniform_ordered(
+            prng,
+            min_bound=0.0,
+            max_bound=1.0,
+            bins=num_samples,
+            batch_dims=(batch_dim_flattened,),
+        )
+        samples = jax.vmap(jnp.interp)(
+            x=x,
+            xp=accumulated_weights.reshape((batch_dim_flattened, -1)),
+            fp=boundaries.reshape((batch_dim_flattened, -1)),
+        ).reshape(batch_dims + (num_samples,))
+
+        return samples
 
 
 def _sample_quasi_uniform_ordered(
@@ -455,7 +466,7 @@ def _sample_quasi_uniform_ordered(
     bins, and selects one sample from each bin.
     Output is in ascending order."""
     sampling_bin_size = (max_bound - min_bound) / bins
-    sampling_bin_starts = onp.arange(0, bins, dtype=onp.float32) * sampling_bin_size
+    sampling_bin_starts = jnp.arange(0, bins) * sampling_bin_size
 
     # Add some batch axes; these two lines are totally unnecessary.
     for i in range(len(batch_dims)):
@@ -469,3 +480,18 @@ def _sample_quasi_uniform_ordered(
     )
     assert samples.shape == batch_dims + (bins,)
     return samples
+
+
+@jax.custom_jvp
+def trunc_exp(x: jnp.ndarray) -> jnp.ndarray:
+    """Exponential with a clipped gradients."""
+    return jnp.exp(x)
+
+
+@trunc_exp.defjvp
+def trunc_exp_jvp(primals, tangents):
+    (x,) = primals
+    (x_dot,) = tangents
+    primal_out = trunc_exp(x)
+    tangent_out = x_dot * jnp.exp(jnp.clip(x, -15, 15))
+    return primal_out, tangent_out

@@ -2,9 +2,10 @@ from typing import Any, Optional, Tuple, cast
 
 import jax
 import jax_dataclasses as jdc
+from einops import rearrange
 from jax import numpy as jnp
 
-from . import cameras, networks, render_common, utils
+from . import cameras, networks, render_common, tensor_vm, utils
 
 
 def render_rays(
@@ -38,22 +39,24 @@ def render_rays(
 
     # Bounded scene: we sample points uniformly between the camera origin and bounding
     # box limit.
-    points, ts, step_sizes = jax.vmap(
+    bins = jax.vmap(
         lambda ray: _sample_points_along_ray_within_bbox(
             ray_wrt_world=ray,
             aabb=aabb,
             samples_per_ray=density_samples_per_ray,
             prng_key=sample_prng_key,
         ),
-        out_axes=(1, 0, 0),
     )(rays_wrt_world)
-    step_sizes = jnp.tile(step_sizes[:, None], (1, density_samples_per_ray))
-
-    assert points.shape == (3, ray_count, density_samples_per_ray)
-    assert ts.shape == (ray_count, density_samples_per_ray)
-    assert step_sizes.shape == (ray_count, density_samples_per_ray)
+    points = rearrange(
+        rays_wrt_world.points_from_ts(ts=bins.ts),
+        "ray sample d -> d ray sample",
+        d=3,
+        ray=ray_count,
+        sample=density_samples_per_ray,
+    )
 
     # Normalize points to [-1, 1].
+    # TODO: this + scene contraction logic could be consolidated.
     points = (
         (points - aabb[0][:, None, None]) / (aabb[1] - aabb[0])[:, None, None] - 0.5
     ) * 2.0
@@ -72,13 +75,7 @@ def render_rays(
     assert prerectified_sigmas.shape == (ray_count, density_samples_per_ray)
 
     # Compute segment probabilities for each ray.
-    probs = render_common.SegmentProbabilities.compute(
-        prerectified_sigmas,
-        step_sizes,
-        ts,
-        near=config.near,
-        far=config.far,
-    )
+    probs = render_common.SegmentProbabilities.compute(prerectified_sigmas, bins)
     assert (
         probs.get_batch_axes()
         == probs.p_exits.shape
@@ -112,6 +109,8 @@ def render_rays(
             learnable_params,
             render_points,
             rays_wrt_world,
+            # TODO: this is kind of gross...
+            interpolate_func=tensor_vm.TensorVM.interpolate,
         )
         rgb_per_point = render_common.direct_rgb_from_mlp(mlp_out)
         return render_common.render_from_mlp_out(
@@ -129,13 +128,8 @@ def _sample_points_along_ray_within_bbox(
     aabb: jnp.ndarray,
     samples_per_ray: int,
     prng_key: Optional[jax.random.KeyArray],
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Return points along a ray.
-
-    Outputs are:
-    - Points of shape `(3, samples_per_ray)`.
-    - Distances from the ray origin of shape `(samples_per_ray,)`.
-    - A scalar step size."""
+) -> render_common.Bins:
+    """Return points along a ray."""
     assert ray_wrt_world.get_batch_axes() == ()
     assert ray_wrt_world.origins.shape == ray_wrt_world.directions.shape == (3,)
 
@@ -143,28 +137,28 @@ def _sample_points_along_ray_within_bbox(
     segment = _ray_segment_from_bounding_box(
         ray_wrt_world, aabb=aabb, min_segment_length=1e-3
     )
-    step_size = (segment.t_max - segment.t_min) / samples_per_ray
+    assert segment.t_min.shape == segment.t_max.shape == ()
+
+    intermediate_boundaries_per_ray = samples_per_ray - 1
+    step_size = (segment.t_max - segment.t_min) / intermediate_boundaries_per_ray
 
     # Get sample points along ray.
-    ts = jnp.arange(samples_per_ray)
+    boundary_ts = jnp.arange(intermediate_boundaries_per_ray)
     if prng_key is not None:
         # Jitter if a PRNG key is passed in.
-        ts = ts + jax.random.uniform(
+        boundary_ts = boundary_ts + jax.random.uniform(
             key=prng_key,
-            shape=ts.shape,
+            shape=boundary_ts.shape,
             dtype=step_size.dtype,
         )
-    ts = ts * step_size
-    ts = segment.t_min + ts
+    boundary_ts = boundary_ts * step_size
+    boundary_ts = segment.t_min + boundary_ts
 
-    # That's it!
-    points = (
-        ray_wrt_world.origins[:, None] + ray_wrt_world.directions[:, None] * ts[None, :]
+    return render_common.Bins.from_boundaries(
+        boundaries=jnp.concatenate(
+            [segment.t_min[None], boundary_ts, segment.t_max[None]]
+        )
     )
-    assert points.shape == (3, samples_per_ray)
-    assert ts.shape == (samples_per_ray,)
-    assert step_size.shape == ()
-    return points, ts, step_size
 
 
 @jdc.pytree_dataclass

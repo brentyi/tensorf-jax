@@ -1,4 +1,5 @@
 dcargs
+dacite
 flax
 jax
 jaxlib

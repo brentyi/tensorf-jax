@@ -105,7 +105,10 @@ class CachedNerfDataloader:
     ) -> fifteen.data.SizedIterable[RenderedRays]:
         class _Inner:
             def __iter__(_self):
-                for i in range(self.minibatch_count()):
+                minibatch_indices = onp.random.default_rng(shuffle_seed).permutation(
+                    self.minibatch_count()
+                )
+                for i in minibatch_indices:
                     yield self._index(
                         slice(i * self.minibatch_size, (i + 1) * self.minibatch_size)
                     )
