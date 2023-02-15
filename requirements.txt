@@ -1,4 +1,5 @@
-dcargs
+tyro
+opencv-python
 flax
 jax
 jaxlib
