@@ -192,9 +192,40 @@ class TensorVMSingle:
         vector_shape = (channel_dim, grid_dim)
 
         return TensorVMSingle(
-            matrix=jax.image.resize(self.matrix, matrix_shape, "linear"),
-            vector=jax.image.resize(self.vector, vector_shape, "linear"),
+            # Note that antialiasing only happens when downsampling.
+            matrix=resize_with_aligned_corners(
+                self.matrix, matrix_shape, "linear", antialias=True
+            ),
+            vector=resize_with_aligned_corners(
+                self.vector, vector_shape, "linear", antialias=True
+            ),
         )
+
+
+def resize_with_aligned_corners(
+    image: jax.Array,
+    shape: Tuple[int, ...],
+    method: Union[str, jax.image.ResizeMethod],
+    antialias: bool,
+):
+    """Alternative to jax.image.resize(), which emulates align_corners=True in PyTorch's
+    interpolation functions."""
+    spatial_dims = tuple(
+        i
+        for i in range(len(shape))
+        if not jax.core.symbolic_equal_dim(image.shape[i], shape[i])
+    )
+    scale = jnp.array([(shape[i] - 1.0) / (image.shape[i] - 1.0) for i in spatial_dims])
+    translation = -(scale / 2.0 - 0.5)
+    return jax.image.scale_and_translate(
+        image,
+        shape,
+        method=method,
+        scale=scale,
+        spatial_dims=spatial_dims,
+        translation=translation,
+        antialias=antialias,
+    )
 
 
 def linear_interpolation_with_channel_axis(
