@@ -12,7 +12,6 @@ python render_360.py --help
 import dataclasses
 import pathlib
 
-import cv2
 import fifteen
 import jax
 import jax_dataclasses as jdc
@@ -58,7 +57,7 @@ class Args:
 
 
 def main(args: Args) -> None:
-    experiment = fifteen.experiments.Experiment(data_dir=args.run_dir)
+    experiment = fifteen.experiments.Experiment(data_dir=args.run_dir.absolute())
     config = experiment.read_metadata("config", tensorf.train_config.TensorfConfig)
 
     # Make sure output directory exists.

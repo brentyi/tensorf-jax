@@ -11,13 +11,13 @@ import jax_dataclasses as jdc
 import optax
 from jax import numpy as jnp
 from tqdm.auto import tqdm
-from typing_extensions import Annotated, assert_never
+from typing_extensions import assert_never
 
 from . import data, networks, render, tensor_vm, train_config, utils
 
 
 @jdc.pytree_dataclass
-class TrainState(jdc.EnforcedAnnotationsMixin):
+class TrainState:
     config: jdc.Static[train_config.TensorfConfig]
 
     # Representation/parameters.
@@ -28,19 +28,16 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     optimizer: jdc.Static[optax.GradientTransformation]
     optimizer_state: optax.OptState
 
-    # Current axis-aligned bounding box.
-    aabb: Annotated[jnp.ndarray, jnp.floating, (2, 3)]
-
-    # Misc.
-    prng_key: jax.random.KeyArray
-    step: Annotated[jnp.ndarray, jnp.integer, ()]
+    aabb: jnp.ndarray  # (2, 3), floating
+    prng_key: jax.Array
+    step: jnp.ndarray  # (), integer
 
     @staticmethod
     @jdc.jit
     def initialize(
         config: jdc.Static[train_config.TensorfConfig],
         grid_dim: jdc.Static[int],
-        prng_key: jax.random.KeyArray,
+        prng_key: jax.Array,
         num_cameras: jdc.Static[int],
     ) -> TrainState:
         prng_keys = jax.random.split(prng_key, 5)
@@ -74,7 +71,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                 per_axis_channel_dim=config.appearance_feat_dim,
                 init=normal_init,
                 prng_key=prng_keys[1],
-                dtype=jnp.float32,  # Main copy of parameters are always float32.
+                dtype=jnp.float32,
             ),
             density_tensor=tensor_vm.TensorVM.initialize(
                 grid_dim=grid_dim,
@@ -108,12 +105,6 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
         """Single training step."""
         render_prng_key, new_prng_key = jax.random.split(self.prng_key)
 
-        # If in mixed-precision mode, we render and backprop in float16.
-        if self.config.mixed_precision:
-            compute_dtype = jnp.float16
-        else:
-            compute_dtype = jnp.float32
-
         def compute_loss(
             learnable_params: render.LearnableParams,
         ) -> Tuple[jnp.ndarray, fifteen.experiments.TensorboardLogData]:
@@ -140,18 +131,13 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                     density_samples_per_ray=density_samples_per_ray,
                     appearance_samples_per_ray=appearance_samples_per_ray,
                 ),
-                dtype=compute_dtype,
             )
             assert (
                 rendered.shape
                 == minibatch.colors.shape
                 == minibatch.get_batch_axes() + (3,)
             )
-            label_colors = minibatch.colors
-            assert jnp.issubdtype(rendered.dtype, compute_dtype)
-            assert jnp.issubdtype(label_colors.dtype, jnp.float32)
-
-            mse = jnp.mean((rendered - label_colors) ** 2)
+            mse = jnp.mean((rendered - minibatch.colors) ** 2)
             loss = mse  # TODO: add regularization terms.
 
             log_data = fifteen.experiments.TensorboardLogData(
@@ -160,30 +146,14 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
                     "psnr": utils.psnr_from_mse(mse),
                 }
             )
-            return loss * self.config.loss_scale, log_data
+            return loss, log_data
 
-        # Compute gradients.
         log_data: fifteen.experiments.TensorboardLogData
         grads: render.LearnableParams
-        learnable_params = jax.tree_map(
-            # Cast parameters to desired precision.
-            lambda x: x.astype(compute_dtype),
-            self.learnable_params,
-        )
         (loss, log_data), grads = jax.value_and_grad(
             compute_loss,
             has_aux=True,
-        )(learnable_params)
-
-        # To prevent NaNs from momentum computations in mixed-precision mode, it's
-        # important that gradients are float32 before being passed to the optimizer.
-        grads_unscaled = jax.tree_map(
-            lambda x: x.astype(jnp.float32) / self.config.loss_scale,
-            grads,
-        )
-        assert jnp.issubdtype(
-            jax.tree_util.tree_leaves(grads_unscaled)[0].dtype, jnp.float32
-        ), "Gradients should always be float32."
+        )(self.learnable_params)
 
         # Compute learning rate decay.
         # We could put this in the optax chain as well, but explicitly computing here
@@ -212,9 +182,9 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
 
         # Propagate gradients through ADAM, learning rate scheduler, etc.
         updates, new_optimizer_state = self.optimizer.update(
-            grads_unscaled, self.optimizer_state, self.learnable_params
+            grads, self.optimizer_state, self.learnable_params
         )
-        updates = jax.tree_map(lambda x: lr_decay_coeff * x, updates)
+        updates = jax.tree.map(lambda x: lr_decay_coeff * x, updates)
 
         # Add learning rates to Tensorboard logs.
         log_data = log_data.merge_scalars(
@@ -241,9 +211,7 @@ class TrainState(jdc.EnforcedAnnotationsMixin):
     ) -> optax.GradientTransformation:
         """Set up Adam optimizer."""
         return optax.chain(
-            # First, we rescale gradients with ADAM. Note that eps=1e-8 is OK because
-            # gradients are always converted to float32 before being passed to the
-            # optimizer.
+            # First, we rescale gradients with ADAM.
             optax.scale_by_adam(
                 b1=0.9,
                 b2=0.99,
@@ -316,7 +284,7 @@ def run_training_loop(
     """Full training loop implementation."""
 
     # Set up our experiment: for checkpoints, logs, metadata, etc.
-    experiment = fifteen.experiments.Experiment(data_dir=config.run_dir)
+    experiment = fifteen.experiments.Experiment(data_dir=config.run_dir.resolve())
     if restore_checkpoint:
         experiment.assert_exists()
         config = experiment.read_metadata("config", train_config.TensorfConfig)

@@ -5,7 +5,7 @@ import dataclasses
 import functools
 import json
 import pathlib
-from typing import Any, Dict, Iterable, List, Literal, Protocol, TypeVar
+from typing import Any, Dict, Iterable, List, Literal, Protocol, Tuple, TypeVar
 
 import cv2
 import jax
@@ -16,7 +16,7 @@ import PIL.Image
 from jax import numpy as jnp
 from optax._src.alias import transform
 from tqdm.auto import tqdm
-from typing_extensions import Annotated, assert_never
+from typing_extensions import assert_never
 
 from . import cameras
 
@@ -137,7 +137,7 @@ class NerfstudioDataset:
                 )
             )
 
-        return jax.tree_map(lambda *leaves: onp.concatenate(leaves, axis=0), *out)
+        return jax.tree.map(lambda *leaves: onp.concatenate(leaves, axis=0), *out)
 
     def get_cameras(self) -> List[cameras.Camera]:
         # Transformation from Blender camera coordinates to OpenCV ones. We like the OpenCV
@@ -280,22 +280,22 @@ class BlenderDataset:
 
 
 @jdc.pytree_dataclass
-class RegisteredRgbaView(jdc.EnforcedAnnotationsMixin):
+class RegisteredRgbaView:
     """Structure containing 2D image + camera pairs."""
 
-    image_rgba: Annotated[
-        jnp.ndarray,
-        jnp.floating,  # Range of contents is [0, 1].
-    ]
+    image_rgba: jnp.ndarray  # floating, range [0, 1]
     camera: cameras.Camera
 
 
 @jdc.pytree_dataclass
-class RenderedRays(jdc.EnforcedAnnotationsMixin):
+class RenderedRays:
     """Structure containing individual 3D rays in world space + colors."""
 
-    colors: Annotated[jnp.ndarray, (3,), jnp.floating]
+    colors: jnp.ndarray  # (*, 3), floating
     rays_wrt_world: cameras.Rays3D
+
+    def get_batch_axes(self) -> Tuple[int, ...]:
+        return self.colors.shape[:-1]
 
 
 def rendered_rays_from_views(views: List[RegisteredRgbaView]) -> RenderedRays:
@@ -328,7 +328,7 @@ def rendered_rays_from_views(views: List[RegisteredRgbaView]) -> RenderedRays:
             )
         )
 
-    out_concat: RenderedRays = jax.tree_map(
+    out_concat: RenderedRays = jax.tree.map(
         lambda *children: onp.concatenate(children, axis=0), *out
     )
 

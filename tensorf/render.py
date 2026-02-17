@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
-from typing import Any, Optional, Tuple, cast
+from typing import Optional, Tuple, cast
 
 import flax
 import jax
@@ -11,9 +11,8 @@ import jax_dataclasses as jdc
 import numpy as onp
 from jax import numpy as jnp
 from tqdm.auto import tqdm
-from typing_extensions import Annotated
 
-from . import cameras, networks, tensor_vm, utils
+from . import cameras, networks, tensor_vm
 
 
 class RenderMode(enum.Enum):
@@ -52,7 +51,7 @@ def render_rays_batched(
     learnable_params: LearnableParams,
     aabb: jnp.ndarray,
     rays_wrt_world: cameras.Rays3D,
-    prng_key: Optional[jax.random.KeyArray],
+    prng_key: Optional[jax.Array],
     config: RenderConfig,
     *,
     batch_size: int = 4096,
@@ -71,6 +70,9 @@ def render_rays_batched(
             camera_indices=rays_wrt_world.camera_indices.reshape((-1,)),
         )
     )
+    # Ensure rays are on the default device (GPU) — pixel_rays_wrt_world
+    # is JIT-compiled on CPU, so the arrays may arrive on the wrong device.
+    rays_wrt_world = jax.device_put(rays_wrt_world, aabb.devices().pop())
     (total_rays,) = rays_wrt_world.get_batch_axes()
 
     processed = 0
@@ -79,7 +81,7 @@ def render_rays_batched(
     for i in (tqdm if use_tqdm else lambda x: x)(
         range(math.ceil(total_rays / batch_size))
     ):
-        batch = jax.tree_map(
+        batch = jax.tree.map(
             lambda x: x[processed : min(total_rays, processed + batch_size)],
             rays_wrt_world,
         )
@@ -106,20 +108,12 @@ def render_rays(
     learnable_params: LearnableParams,
     aabb: jnp.ndarray,
     rays_wrt_world: cameras.Rays3D,
-    prng_key: jax.random.KeyArray,
+    prng_key: jax.Array,
     config: jdc.Static[RenderConfig],
-    *,
-    dtype: jdc.Static[Any] = jnp.float32,
 ) -> jnp.ndarray:
     """Render a set of rays.
 
     Output should have shape `(ray_count, 3)`."""
-
-    # Cast everything to the desired dtype.
-    learnable_params, aabb, rays_wrt_world = jax.tree_map(
-        lambda x: x.astype(dtype) if jnp.issubdtype(jnp.floating, dtype) else x,
-        (learnable_params, aabb, rays_wrt_world),
-    )
 
     (ray_count,) = rays_wrt_world.get_batch_axes()
 
@@ -213,7 +207,7 @@ def render_rays(
     sigmas = jax.nn.softplus(jnp.sum(density_feat, axis=0) + 10.0)
     assert sigmas.shape == (ray_count, config.density_samples_per_ray)
 
-    # Compute segment probabilities for each ray.
+    # Segment probabilities.
     probs = compute_segment_probabilities(sigmas, step_sizes)
     assert (
         probs.get_batch_axes()
@@ -223,7 +217,6 @@ def render_rays(
     )
 
     if config.mode is RenderMode.RGB:
-        # Get RGB array.
         rgb, unbias_coeff = _rgb_from_points(
             rays_wrt_world=rays_wrt_world,
             probs=probs,
@@ -232,18 +225,11 @@ def render_rays(
             appearance_mlp=appearance_mlp,
             config=config,
             prng_key=render_rgb_prng_key,
-            dtype=dtype,
         )
         assert rgb.shape == (ray_count, config.density_samples_per_ray, 3)
         assert unbias_coeff.shape == (ray_count,)
 
-        # No need to backprop through the unbiasing coefficient! This can also cause
-        # instability in mixed-precision mode.
-        unbias_coeff = jax.lax.stop_gradient(unbias_coeff)
-
-        # One thing I don't have intuition for: is there something special about RGB
-        # that makes this weighted average/expected value meaningful? Is this
-        # because RGB is additive? Can we just do this with any random color space?
+        # Weighted sum of RGB values, corrected by unbiasing coefficient.
         expected_rgb = (
             jnp.sum(rgb * probs.p_terminates[:, :, None], axis=-2)
             * unbias_coeff[:, None]
@@ -252,7 +238,7 @@ def render_rays(
 
         # Add white background.
         assert probs.p_exits.shape == (ray_count, config.density_samples_per_ray)
-        background_color = jnp.ones(3, dtype=dtype)
+        background_color = jnp.ones(3)
         expected_rgb_with_background = (
             expected_rgb + probs.p_exits[:, -1:] * background_color
         )
@@ -262,10 +248,10 @@ def render_rays(
     elif config.mode is RenderMode.DIST_MEDIAN:
         # Compute depth via median.
         sample_distances = jnp.concatenate(
-            [ts, jnp.full((ray_count, 1), jnp.inf, dtype=dtype)], axis=-1
+            [ts, jnp.full((ray_count, 1), jnp.inf)], axis=-1
         )
         p_not_alive_padded = jnp.concatenate(
-            [1.0 - probs.p_exits, jnp.ones((ray_count, 1), dtype=dtype)], axis=-1
+            [1.0 - probs.p_exits, jnp.ones((ray_count, 1))], axis=-1
         )
         assert sample_distances.shape == p_not_alive_padded.shape
 
@@ -294,18 +280,21 @@ def render_rays(
 
 
 @jdc.pytree_dataclass
-class SegmentProbabilities(jdc.EnforcedAnnotationsMixin):
-    p_exits: Annotated[jnp.ndarray, (), jnp.floating]
+class SegmentProbabilities:
+    p_exits: jnp.ndarray  # (*, sample_count), floating
     """P(ray exits segment s).
 
     Note that this also implies that the ray has exited (and thus entered) all previous
     segments."""
 
-    p_terminates: Annotated[jnp.ndarray, (), jnp.floating]
+    p_terminates: jnp.ndarray  # (*, sample_count), floating
     """P(ray terminates at s, ray exits s - 1).
 
     For a ray to terminate in a segment, it must first pass through (and 'exit') all
     previous segments."""
+
+    def get_batch_axes(self) -> Tuple[int, ...]:
+        return self.p_exits.shape
 
 
 def compute_segment_probabilities(
@@ -362,7 +351,7 @@ def sample_points_along_ray_within_bbox(
     ray_wrt_world: cameras.Rays3D,
     aabb: jnp.ndarray,
     samples_per_ray: int,
-    prng_key: Optional[jax.random.KeyArray],
+    prng_key: Optional[jax.Array],
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Return points along a ray.
 
@@ -422,7 +411,7 @@ def ray_segment_from_bounding_box(
     #     t = (bounding box - origin) / direction
     offsets = aabb - ray_wrt_world.origins[None, :]
     t_intersections = offsets / (
-        ray_wrt_world.directions + utils.eps_from_dtype(offsets.dtype)
+        ray_wrt_world.directions + 1e-8
     )
 
     # Compute near/far distances.
@@ -452,8 +441,7 @@ def _rgb_from_points(
     points: jnp.ndarray,
     appearance_mlp: networks.FeatureMlp,
     config: RenderConfig,
-    prng_key: jax.random.KeyArray,
-    dtype: Any,
+    prng_key: jax.Array,
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """Helper for rendering RGB values. Returns an RGB array of shape `(ray_count,
     config.samples_per_ray, 3)`, and an unbiasing coefficient array of shape
@@ -517,15 +505,11 @@ def _rgb_from_points(
             ),
             viewdirs=viewdirs,
             camera_indices=camera_indices,
-            dtype=dtype,
         ),
     ).reshape((ray_count, config.appearance_samples_per_ray, 3))
 
     rgb = (
-        jnp.zeros(
-            (ray_count, config.density_samples_per_ray, 3),
-            dtype=dtype,
-        )
+        jnp.zeros((ray_count, config.density_samples_per_ray, 3))
         .at[jnp.arange(ray_count)[:, None], appearance_indices, :]
         .set(visible_rgb)
     )
@@ -554,11 +538,11 @@ def _rgb_from_points(
         # The 0.95 term in the example.
         1.0
         - probs.p_exits[:, -1]
-        + utils.eps_from_dtype(dtype)
+        + 1e-8
     ) / (
         # The 0.7 term in the example.
         jnp.sum(sampled_p_terminates, axis=1)
-        + utils.eps_from_dtype(dtype)
+        + 1e-8
     )
     assert unbias_coeff.shape == (ray_count,)
 

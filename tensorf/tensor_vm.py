@@ -8,8 +8,6 @@ import jax_dataclasses as jdc
 from jax import numpy as jnp
 
 Shape = Tuple[int, ...]
-Dtype = Any
-
 Scalar = Union[float, jnp.ndarray]
 
 
@@ -24,9 +22,9 @@ class TensorVM:
     def initialize(
         grid_dim: int,
         per_axis_channel_dim: int,
-        init: Callable[[jax.random.KeyArray, Shape, Dtype], jnp.ndarray],
-        prng_key: jax.random.KeyArray,
-        dtype: Dtype,
+        init: Callable[[jax.Array, Shape, Any], jnp.ndarray],
+        prng_key: jax.Array,
+        dtype: Any,
     ) -> TensorVM:
         prng_keys = jax.random.split(prng_key, 3)
         return TensorVM(
@@ -57,8 +55,7 @@ class TensorVM:
         interpolate_func = TensorVMSingle.interpolate
         if len(batch_axes) >= 2:
             # TODO: this magic vmap is unnecessary and doesn't impact numerical results,
-            # but enables a massive performance increase. This is 3~4x better training
-            # throughput for single-precision, ~1.5x in mixed-precision.
+            # but enables a massive 3~4x training throughput improvement.
             #
             # I'm not exactly sure why, but it appears to:
             # - Shuffle the memory layout and improve access patterns.
@@ -120,9 +117,9 @@ class TensorVMSingle:
     def initialize(
         grid_dim: int,
         channel_dim: int,
-        init: Callable[[jax.random.KeyArray, Shape, Dtype], jnp.ndarray],
-        prng_key: jax.random.KeyArray,
-        dtype: Dtype,
+        init: Callable[[jax.Array, Shape, Any], jnp.ndarray],
+        prng_key: jax.Array,
+        dtype: Any,
     ) -> TensorVMSingle:
         """ "Initialize a VM-decomposed 4D tensor (depth, width, height, channel).
 
@@ -211,9 +208,7 @@ def resize_with_aligned_corners(
     """Alternative to jax.image.resize(), which emulates align_corners=True in PyTorch's
     interpolation functions."""
     spatial_dims = tuple(
-        i
-        for i in range(len(shape))
-        if not jax.core.symbolic_equal_dim(image.shape[i], shape[i])
+        i for i in range(len(shape)) if image.shape[i] != shape[i]
     )
     scale = jnp.array([(shape[i] - 1.0) / (image.shape[i] - 1.0) for i in spatial_dims])
     translation = -(scale / 2.0 - 0.5)

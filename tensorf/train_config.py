@@ -58,22 +58,6 @@ class TensorfConfig:
     # TODO: unimplemented. (can we even implement this in JAX?)
     # update_alphamask_iters: Tuple[int, ...] = (2000, 4000)
 
-    # If enabled, we use mixed-precision training. This seems to work and speeds up
-    # training throughput by a significant factor, but is disabled by default because we
-    # haven't fully evaluated stability, impact on convergence, hyperparameters, etc.
-    #
-    # Important: if mixed precision is enabled, the loss scale should generally be set
-    # to something high!
-    mixed_precision: bool = False
-
-    # Loss scale for preventing gradient underflow.
-    #
-    # Applied always but useful mostly for mixed-precision training, where we observe a
-    # tradeoff where a higher value will produce lower errors and improve convergence,
-    # but can run slower despite a nearly identical computation graph. (possibly due to
-    # some reduced sparsity of gradients?)
-    loss_scale: float = 1.0
-
     # Apply MipNeRF-360-inspired scene contraction. Useful for real data.
     scene_contraction: bool = False
     scene_scale: float = 1.0

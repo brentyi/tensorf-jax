@@ -43,25 +43,25 @@ dataset:
    [official instructions](https://github.com/google/jax#Installation). Then:
 
    ```bash
-   pip install -r requirements.txt
+   uv sync
    ```
 
 3. To print training options:
 
    ```bash
-   python ./train_lego.py --help
+   uv run python ./train_lego.py --help
    ```
 
 4. To monitor training, we use Tensorboard:
 
    ```bash
-   tensorboard --logdir=./runs/
+   uv run tensorboard --logdir=./runs/
    ```
 
 5. To render:
 
    ```bash
-   python ./render_360.py --help
+   uv run python ./render_360.py --help
    ```
 
 ## Differences from the PyTorch implementation
@@ -74,9 +74,6 @@ Things aren't totally matched to the official implementation:
   replace them with workarounds like weighted sampling.
 - Several training details that would likely improve performance are not yet
   implemented: bounding box refinement, ray filtering, regularization, etc.
-- We include mixed-precision training, which can speed training throughput up by
-  a significant factor. (is this actually faster in terms of wall-clock time?
-  unclear)
 
 ## References
 
@@ -128,9 +125,6 @@ to JAX!
   - [x] Weight thresholding for computing appearance features
     - [x] per ray top-k
     - [x] global top-k (bad & deleted)
-  - [x] Mixed-precision
-    - [x] implemented
-    - [x] stable
   - [ ] Multi-GPU (should be quick)
 - [x] Rendering
   - [x] RGB

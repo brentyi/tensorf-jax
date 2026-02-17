@@ -1,15 +1,13 @@
 """Neural networks for volumetric rendering."""
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 from flax import linen as nn
 from jax import numpy as jnp
 
 relu_layer_init = nn.initializers.kaiming_normal()  # variance = 2.0 / fan_in
 linear_layer_init = nn.initializers.lecun_normal()  # variance = 1.0 / fan_in
-
-Dtype = Any
 
 
 def _fourier_encode(coords: jnp.ndarray, n_freqs: int) -> jnp.ndarray:
@@ -50,8 +48,6 @@ class FeatureMlp(nn.Module):
         features: jnp.ndarray,
         viewdirs: jnp.ndarray,
         camera_indices: jnp.ndarray,
-        # Computation dtype. Main parameters will always be float32.
-        dtype: Any = jnp.float32,
     ) -> jnp.ndarray:
         *batch_axes, feat_dim = features.shape
         assert viewdirs.shape == (*batch_axes, 3)
@@ -62,7 +58,6 @@ class FeatureMlp(nn.Module):
             features=self.feature_squash_dim,
             kernel_init=linear_layer_init,
             use_bias=False,
-            dtype=dtype,
         )(features)
 
         # Compute fourier features.
@@ -91,7 +86,6 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=self.units,
             kernel_init=relu_layer_init,
-            dtype=dtype,
         )(x)
         x = nn.relu(x)
         assert x.shape == (*batch_axes, self.units)
@@ -100,7 +94,6 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=self.units,
             kernel_init=relu_layer_init,
-            dtype=dtype,
         )(x)
         x = nn.relu(x)
         assert x.shape == (*batch_axes, self.units)
@@ -121,7 +114,6 @@ class FeatureMlp(nn.Module):
         x = nn.Dense(
             features=3,
             kernel_init=linear_layer_init,
-            dtype=dtype,
         )(x)
         assert x.shape == (*batch_axes, 3)
 

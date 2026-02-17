@@ -1,28 +1,28 @@
-from typing import Union
+from typing import Tuple, Union
 
 import jax
 import jax_dataclasses as jdc
 import jaxlie
 import numpy as onp
 from jax import numpy as jnp
-from typing_extensions import Annotated
 
 
 @jdc.pytree_dataclass
-class Rays3D(jdc.EnforcedAnnotationsMixin):
+class Rays3D:
     """Structure defining some rays in 3D space. Should contain origin and direction
     arrays of the same shape; `(*, 3)`."""
 
-    origins: Annotated[jnp.ndarray, (3,), jnp.floating]
-    directions: Annotated[jnp.ndarray, (3,), jnp.floating]
-    camera_indices: Annotated[
-        jnp.ndarray, (), jnp.uint32
-    ]  # Used for per-camera appearance embeddings.
+    origins: jnp.ndarray  # (*, 3), floating
+    directions: jnp.ndarray  # (*, 3), floating
+    camera_indices: jnp.ndarray  # (*,), uint32. Used for per-camera appearance embeddings.
+
+    def get_batch_axes(self) -> Tuple[int, ...]:
+        return self.origins.shape[:-1]
 
 
 @jdc.pytree_dataclass
-class Camera(jdc.EnforcedAnnotationsMixin):
-    K: Annotated[jnp.ndarray, (3, 3), jnp.floating]
+class Camera:
+    K: jnp.ndarray  # (3, 3), floating
     """Intrinsics. alpha * [u v 1]^T = K @ [x_c y_c z_c]^T"""
 
     T_camera_world: jaxlie.SE3
